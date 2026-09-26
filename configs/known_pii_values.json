@@ -1,0 +1,23 @@
+{
+  "_comment": "AntShield's predefined-PII detection works because the collection system knows the *actual* device/account values it's monitoring for (a specific IMEI, a specific test account email, etc.) and searches for those literal strings. The public dataset gives you the TYPE that leaked, not always the literal value. If you have access to the test-device/account values used during AntShield's collection (check the dataset's accompanying docs/config), fill them in here per type so span offsets can be found by exact string search. Anything left empty falls back to regex/key-heuristic matching in convert_to_gliner_format.py, which is lower precision for opaque IDs like AndroidId/IMEI.",
+
+  "email address": [],
+  "phone number": [],
+  "android device id": [],
+  "imei number": [],
+  "imsi number": [],
+  "device serial number": [],
+  "sim card iccid": [],
+  "mac address": [],
+  "advertiser id": [],
+  "username": [],
+  "password": [],
+  "first name": [],
+  "last name": [],
+  "gender": [],
+  "zip code": [],
+  "city": [],
+  "location coordinates": [],
+  "latitude": [],
+  "longitude": []
+}

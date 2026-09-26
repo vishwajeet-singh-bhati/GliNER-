@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+data/*.jsonl
+data/sample_raw.json
+*.pt
+*.onnx

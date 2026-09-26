@@ -1,0 +1,5 @@
+gliner>=0.2.13
+torch>=2.1
+tqdm
+scikit-learn
+numpy
