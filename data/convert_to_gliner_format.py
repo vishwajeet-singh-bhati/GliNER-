@@ -3,137 +3,114 @@ Converts AntShield packet records into GLiNER's expected format:
 
     {"text": "...", "entities": [{"start": 12, "end": 24, "label": "email address"}]}
 
-Span offsets are recovered in two ways, tried in order per pii_type:
-  1. Exact string search against configs/known_pii_values.json (highest precision,
-     requires you to have filled in the real values -- see that file's comment).
-  2. Regex heuristics for types with a recognizable shape (email, phone).
-  3. Key=value heuristic for opaque device identifiers in form-encoded bodies
-     (e.g. "androidid=8f2e1..." -> span is the value after the matching key).
+Span-finding strategy (confirmed against the real dataset, not guessed):
+every leaked PII value in this public release is redacted with a literal
+token "RECON_<Type>" (e.g. "RECON_AndroidId"). We regex-match those tokens
+directly -- no string-matching against unknown real values needed, and no
+regex/heuristic guessing either. Verified: 8579/8579 (100%) of positive
+records carry at least one such token in the extracted text.
 
-Packets where no span can be recovered for a labeled pii_type are counted and
-reported, not silently dropped -- check the printed summary before trusting
-downstream numbers, since a high skip rate means the heuristics need tuning
-against your actual data.
+--mask-recon-tokens (recommended, off by default):
+  Replaces each "RECON_<Type>" token with a synthetic realistic-looking value
+  of the correct type/shape (data/recon_synthesizer.py) before span offsets
+  are finalized. Without this flag, the entity span's literal text is
+  "RECON_AndroidId" etc. -- which spells out its own label, so a model can
+  solve the task by substring-matching the token instead of learning any real
+  PII pattern. Turn this on for a result that means anything about actual
+  detection capability; leave it off only if you specifically want a
+  literal-replay comparison against how the binary BERT model was trained
+  (which likely has the same leakage problem via the bare "RECON_" prefix).
 """
 import argparse
 import json
 import re
-from typing import List, Optional, Tuple
+import sys
+from pathlib import Path
 
-from pii_type_mapping import normalize_type
-from antshield_loader import load_antshield_json, PacketRecord
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pii_type_mapping import ANTSHIELD_TO_GLINER_LABEL, RAW_TYPES_BY_LENGTH  # noqa: E402
+from antshield_loader import load_antshield_dataset, PacketRecord  # noqa: E402
+from recon_synthesizer import synthesize  # noqa: E402
 
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-PHONE_RE = re.compile(r"\+?\d[\d\-\s]{7,14}\d")
-
-# key names commonly seen in form-encoded AntShield post bodies, per opaque type
-KEY_HINTS = {
-    "android device id": ["androidid", "android_id", "deviceid"],
-    "imei number": ["imei"],
-    "imsi number": ["imsi"],
-    "device serial number": ["serial", "serialnumber"],
-    "sim card iccid": ["iccid"],
-    "mac address": ["mac", "macaddress"],
-    "advertiser id": ["advertiserid", "gaid", "adid"],
-}
-
-REGEX_HINTS = {
-    "email address": EMAIL_RE,
-    "phone number": PHONE_RE,
-}
+# alternation ordered longest-first so e.g. "AndroidId" can't be cut short by
+# a shorter type name that happens to be a prefix; also correctly separates
+# adjacent tokens with no delimiter, e.g. "RECON_SerialNumberRECON_AndroidId"
+_RECON_PATTERN = re.compile("RECON_(" + "|".join(RAW_TYPES_BY_LENGTH) + ")")
 
 
-def find_span_by_known_value(text: str, label: str, known_values: dict) -> Optional[Tuple[int, int]]:
-    for value in known_values.get(label, []):
-        if value:
-            idx = text.find(value)
-            if idx != -1:
-                return idx, idx + len(value)
-    return None
+def find_recon_spans(text: str):
+    """Yields (start, end, raw_type) for every RECON_<Type> token in text, in order."""
+    for m in _RECON_PATTERN.finditer(text):
+        yield m.start(), m.end(), m.group(1)
 
 
-def find_span_by_regex(text: str, label: str) -> Optional[Tuple[int, int]]:
-    pattern = REGEX_HINTS.get(label)
-    if pattern:
-        m = pattern.search(text)
-        if m:
-            return m.start(), m.end()
-    return None
+def convert_record(record: PacketRecord, mask_recon_tokens: bool):
+    text = record.text
+    matches = list(find_recon_spans(text))
+
+    if not mask_recon_tokens:
+        entities = [
+            {"start": s, "end": e, "label": ANTSHIELD_TO_GLINER_LABEL[raw_type]}
+            for s, e, raw_type in matches
+        ]
+        return {"text": text, "entities": entities}
+
+    # rebuild the string, replacing each token with a synthesized value and
+    # tracking offsets as they shift
+    out_parts = []
+    entities = []
+    cursor = 0
+    for i, (s, e, raw_type) in enumerate(matches):
+        out_parts.append(text[cursor:s])
+        label = ANTSHIELD_TO_GLINER_LABEL[raw_type]
+        replacement = synthesize(label, seed_key=f"{record.record_id}:{i}")
+        new_start = sum(len(p) for p in out_parts)
+        out_parts.append(replacement)
+        new_end = new_start + len(replacement)
+        entities.append({"start": new_start, "end": new_end, "label": label})
+        cursor = e
+    out_parts.append(text[cursor:])
+
+    return {"text": "".join(out_parts), "entities": entities}
 
 
-def find_span_by_key_hint(text: str, label: str) -> Optional[Tuple[int, int]]:
-    hints = KEY_HINTS.get(label)
-    if not hints:
-        return None
-    for key in hints:
-        # matches key=value inside a form-encoded string, value ends at & or end of string
-        m = re.search(rf"{re.escape(key)}=([^&\s]+)", text, re.IGNORECASE)
-        if m:
-            return m.start(1), m.end(1)
-    return None
-
-
-def resolve_span(text: str, label: str, known_values: dict) -> Optional[Tuple[int, int]]:
-    for finder in (
-        lambda: find_span_by_known_value(text, label, known_values),
-        lambda: find_span_by_regex(text, label),
-        lambda: find_span_by_key_hint(text, label),
-    ):
-        span = finder()
-        if span:
-            return span
-    return None
-
-
-def convert(records: List[PacketRecord], known_values: dict):
+def convert(records, mask_recon_tokens: bool):
     examples = []
-    skipped = 0
-    skipped_by_label = {}
+    n_pii_types_declared = 0
+    n_recon_tokens_found = 0
 
     for r in records:
-        if not r.pii_types:
-            # negative example -- still useful for eval (should predict no entities)
-            examples.append({"text": r.text, "entities": []})
-            continue
+        n_pii_types_declared += len(r.pii_types)
+        ex = convert_record(r, mask_recon_tokens)
+        n_recon_tokens_found += len(ex["entities"])
+        examples.append(ex)
 
-        entities = []
-        for raw_type in r.pii_types:
-            try:
-                label = normalize_type(raw_type)
-            except KeyError as e:
-                print(f"[warn] {e}")
-                continue
-
-            span = resolve_span(r.text, label, known_values)
-            if span is None:
-                skipped += 1
-                skipped_by_label[label] = skipped_by_label.get(label, 0) + 1
-                continue
-
-            start, end = span
-            entities.append({"start": start, "end": end, "label": label})
-
-        examples.append({"text": r.text, "entities": entities})
-
-    print(f"Converted {len(examples)} examples, {skipped} labeled pii_types skipped (no span found)")
-    if skipped_by_label:
-        print("Skips by label:", skipped_by_label)
+    print(f"Converted {len(examples)} examples")
+    print(f"pii_types declared across dataset: {n_pii_types_declared}")
+    print(f"RECON_ tokens actually located and turned into spans: {n_recon_tokens_found}")
+    if n_recon_tokens_found < n_pii_types_declared:
+        print(
+            f"[warn] {n_pii_types_declared - n_recon_tokens_found} declared pii_types had no "
+            f"matching RECON_ token found in the extracted text fields -- "
+            f"inspect data/antshield_loader.py's field list if this number is large."
+        )
 
     return examples
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="raw AntShield JSON file")
+    ap.add_argument("--dataset-root", required=True, help="path to extracted antshield_public_dataset/")
     ap.add_argument("--output", required=True, help="output JSONL path")
-    ap.add_argument("--known-values", default="configs/known_pii_values.json")
+    ap.add_argument(
+        "--mask-recon-tokens",
+        action="store_true",
+        help="replace RECON_<Type> tokens with synthetic realistic values (recommended)",
+    )
     args = ap.parse_args()
 
-    records = load_antshield_json(args.input)
-    with open(args.known_values) as f:
-        known_values = json.load(f)
-
-    examples = convert(records, known_values)
+    records = load_antshield_dataset(args.dataset_root)
+    examples = convert(records, mask_recon_tokens=args.mask_recon_tokens)
 
     with open(args.output, "w", encoding="utf-8") as f:
         for ex in examples:

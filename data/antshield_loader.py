@@ -1,66 +1,106 @@
 """
-Parses raw AntShield packet JSON into flat records this project works with.
+Loader for the actual antshield_public_dataset.zip layout:
 
-AntShield's documented schema (per the dataset README and SPAWC'18 paper) is
-a dict keyed by "<timestamp>,<uuid>" with fields including post_body, headers,
-label (0/1), and pii_types (list of strings). This loader is written against
-that schema. If your downloaded copy differs, this is the one file to edit --
-everything downstream consumes the flat record shape below and doesn't care
-about AntShield's raw nesting.
+    antshield_public_dataset/
+      exposures.csv         <- aggregate counts per (pii type, package, dest), not per-packet
+      apps_info.csv          <- app metadata, not needed for this pipeline
+      raw_data/
+        <collection_method>/         e.g. auto_anteater, manual_anteater
+          <batch>/                   e.g. batch1..batch6
+            <protocol>/               HTTP or HTTPS
+              <package_name>.json     dict keyed by "<ts>,<uuid>" -> packet
+
+Each packet dict has (confirmed by direct inspection): post_body, headers
+(dict), uri, user_agent, referrer, label (0/1), pii_types (list or null),
+package_name, protocol, platform, method, host, dst_ip, dst_port, etc.
+
+Critical finding: this public release is REDACTED. Every leaked PII value is
+replaced with a literal sentinel token of the form RECON_<Type>, e.g.
+"RECON_AndroidId", "RECON_Email". Confirmed present in uri, post_body,
+headers, user_agent, and referrer -- covering 8579/8579 (100%) of positive
+records. See convert_to_gliner_format.py for why this matters (label leakage)
+and how it's handled.
 """
+import glob
 import json
+import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
 class PacketRecord:
-    record_id: str
-    text: str            # concatenation of the text-bearing fields we search over
-    label: int            # 0/1 binary PII presence, kept for continuity with the BERT experiment
+    record_id: str          # "<file_path>::<ts,uuid key>"
+    text: str                 # concatenation of every field that can carry PII
+    label: int
     pii_types: List[str] = field(default_factory=list)
     package_name: str = ""
+    protocol: str = ""
 
 
 def _extract_text(packet: dict) -> str:
     """
-    Concatenate the fields where PII actually shows up: POST body and header
-    values. We deliberately skip header *names* (Content-Type, Host, etc.)
-    since those are structural, not PII-bearing.
+    Concatenate every field confirmed (by direct scan) to carry PII, each
+    prefixed with a tag so you can tell where a match came from if you inspect
+    the converted output later. Order matters only for readability, not
+    correctness -- span offsets are computed after this string is built.
     """
-    parts = []
-    post_body = packet.get("post_body")
-    if post_body:
-        parts.append(str(post_body))
+    pieces = []
+    for field_name in ("uri", "post_body", "user_agent", "referrer"):
+        val = packet.get(field_name)
+        if val:
+            pieces.append(f"{field_name}: {val}")
 
-    headers = packet.get("headers", {}) or {}
-    for v in headers.values():
-        parts.append(str(v))
+    headers = packet.get("headers") or {}
+    for k, v in headers.items():
+        if v:
+            pieces.append(f"header_{k}: {v}")
 
-    return " ".join(parts)
+    return " | ".join(pieces)
 
 
-def load_antshield_json(path: str) -> List[PacketRecord]:
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
+def load_antshield_dataset(dataset_root: str) -> List[PacketRecord]:
+    """
+    dataset_root: path to the extracted antshield_public_dataset/ folder
+    (the one directly containing raw_data/, exposures.csv, apps_info.csv).
+    """
+    pattern = os.path.join(dataset_root, "raw_data", "**", "*.json")
+    files = glob.glob(pattern, recursive=True)
+    if not files:
+        raise FileNotFoundError(
+            f"No JSON files found under {pattern}. "
+            f"Check that dataset_root points at the folder containing raw_data/."
+        )
 
     records = []
-    for record_id, packet in raw.items():
-        records.append(
-            PacketRecord(
-                record_id=record_id,
-                text=_extract_text(packet),
-                label=int(packet.get("label", 0)),
-                pii_types=list(packet.get("pii_types", []) or []),
-                package_name=packet.get("package_name", ""),
+    for fp in files:
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                packets = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"[warn] skipping unparseable file {fp}: {e}")
+            continue
+
+        for key, packet in packets.items():
+            records.append(
+                PacketRecord(
+                    record_id=f"{fp}::{key}",
+                    text=_extract_text(packet),
+                    label=int(packet.get("label", 0)),
+                    pii_types=list(packet.get("pii_types") or []),
+                    package_name=packet.get("package_name", ""),
+                    protocol=packet.get("protocol", ""),
+                )
             )
-        )
     return records
 
 
 if __name__ == "__main__":
     import sys
-    recs = load_antshield_json(sys.argv[1])
-    print(f"Loaded {len(recs)} records, {sum(r.label for r in recs)} positive")
-    for r in recs[:3]:
-        print(r)
+    recs = load_antshield_dataset(sys.argv[1])
+    n_pos = sum(r.label for r in recs)
+    print(f"Loaded {len(recs)} records from {sys.argv[1]}, {n_pos} positive ({n_pos/len(recs):.1%})")
+    for r in recs:
+        if r.label == 1:
+            print(r)
+            break
