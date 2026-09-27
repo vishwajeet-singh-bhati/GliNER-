@@ -8,12 +8,15 @@ investing in it.
 """
 import argparse
 import json
+import os
 import sys
 from collections import defaultdict
 
 from gliner import GLiNER
 
-sys.path.insert(0, "../data")
+# resolve ../data relative to this file, not the caller's cwd
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_THIS_DIR, "..", "data"))
 from pii_type_mapping import all_gliner_labels  # noqa: E402
 
 
