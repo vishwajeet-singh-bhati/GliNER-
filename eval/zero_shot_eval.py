@@ -18,6 +18,7 @@ from gliner import GLiNER
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_THIS_DIR, "..", "data"))
 from pii_type_mapping import all_gliner_labels  # noqa: E402
+from chunking import predict_with_chunking  # noqa: E402
 
 
 def load_jsonl(path):
@@ -41,7 +42,7 @@ def evaluate(model, examples, labels, threshold=0.5):
         if not text.strip():
             continue
 
-        predicted = model.predict_entities(text, labels, threshold=threshold)
+        predicted = predict_with_chunking(model, text, labels, threshold=threshold)
         pred_entities = [
             {"start": p["start"], "end": p["end"], "label": p["label"]} for p in predicted
         ]

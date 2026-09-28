@@ -25,7 +25,30 @@ import glob
 import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
+
+_DEFAULT_PRODUCTIVE_HEADERS_PATH = Path(__file__).resolve().parent.parent / "configs" / "productive_header_keys.json"
+
+
+def _load_productive_headers(path=_DEFAULT_PRODUCTIVE_HEADERS_PATH) -> Optional[set]:
+    """
+    Loads the data-driven whitelist of header keys that have ever carried a
+    RECON_ token (see analyze_pii_bearing_fields.py). Out of ~400 distinct
+    header keys in this dataset, ~30 are productive -- the rest are pure
+    token bloat (Content-Type, Accept-Encoding, dozens of per-SDK tracking
+    headers) that push packets past GLiNER's 384-token limit for no benefit.
+    Returns None (include everything, old behavior) if the whitelist hasn't
+    been generated yet, with a one-time warning.
+    """
+    if not os.path.exists(path):
+        print(
+            f"[warn] {path} not found -- including ALL header keys (verbose, more truncation). "
+            f"Run: python data/analyze_pii_bearing_fields.py --dataset-root <path> to generate it."
+        )
+        return None
+    with open(path) as f:
+        return set(json.load(f))
 
 
 @dataclass
@@ -38,12 +61,15 @@ class PacketRecord:
     protocol: str = ""
 
 
-def _extract_text(packet: dict) -> str:
+def _extract_text(packet: dict, productive_headers: Optional[set]) -> str:
     """
     Concatenate every field confirmed (by direct scan) to carry PII, each
     prefixed with a tag so you can tell where a match came from if you inspect
     the converted output later. Order matters only for readability, not
     correctness -- span offsets are computed after this string is built.
+
+    productive_headers: lowercased set of header keys worth including
+    (from analyze_pii_bearing_fields.py). None means include all headers.
     """
     pieces = []
     for field_name in ("uri", "post_body", "user_agent", "referrer"):
@@ -53,8 +79,11 @@ def _extract_text(packet: dict) -> str:
 
     headers = packet.get("headers") or {}
     for k, v in headers.items():
-        if v:
-            pieces.append(f"header_{k}: {v}")
+        if not v:
+            continue
+        if productive_headers is not None and k.lower() not in productive_headers:
+            continue
+        pieces.append(f"header_{k}: {v}")
 
     return " | ".join(pieces)
 
@@ -72,6 +101,8 @@ def load_antshield_dataset(dataset_root: str) -> List[PacketRecord]:
             f"Check that dataset_root points at the folder containing raw_data/."
         )
 
+    productive_headers = _load_productive_headers()
+
     records = []
     for fp in files:
         try:
@@ -85,7 +116,7 @@ def load_antshield_dataset(dataset_root: str) -> List[PacketRecord]:
             records.append(
                 PacketRecord(
                     record_id=f"{fp}::{key}",
-                    text=_extract_text(packet),
+                    text=_extract_text(packet, productive_headers),
                     label=int(packet.get("label", 0)),
                     pii_types=list(packet.get("pii_types") or []),
                     package_name=packet.get("package_name", ""),

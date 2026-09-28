@@ -1,5 +1,11 @@
 # Mobile inference plan (Phase 2-3, not started)
 
+Target device: **Pixel 6a** (Google Tensor SoC, ARMv8.2-A cores -- NEON-
+compatible, same instruction set family your BERT kernels already target;
+Android 12+, wireless ADB works the same way as your prior physical-device
+benchmarking).
+
+
 Reuse from the BERT quantization project:
 - ARM NEON kernels for the transformer encoder forward pass (FP32 / Q4_0 / E8)
 - Wireless ADB benchmarking harness on the physical device

@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pii_type_mapping import ANTSHIELD_TO_GLINER_LABEL, RAW_TYPES_BY_LENGTH  # noqa: E402
 from antshield_loader import load_antshield_dataset, PacketRecord  # noqa: E402
 from recon_synthesizer import synthesize  # noqa: E402
+from splitting import assign_split  # noqa: E402
 
 # alternation ordered longest-first so e.g. "AndroidId" can't be cut short by
 # a shorter type name that happens to be a prefix; also correctly separates
@@ -107,9 +108,29 @@ def main():
         action="store_true",
         help="replace RECON_<Type> tokens with synthetic realistic values (recommended)",
     )
+    ap.add_argument(
+        "--split",
+        choices=["train", "val", "test", "all"],
+        default="all",
+        help="filter to one split using the same record_id hashing as "
+             "prepare_finetune_data.py, so this eval-format file and that "
+             "script's *_finetune.jsonl agree on which records are 'test' "
+             "(default 'all' -- fine for a pure zero-shot run with no "
+             "fine-tuning to leak against, but use 'test' when evaluating a "
+             "fine-tuned checkpoint)",
+    )
+    ap.add_argument("--train-frac", type=float, default=0.7)
+    ap.add_argument("--val-frac", type=float, default=0.15)
     args = ap.parse_args()
 
     records = load_antshield_dataset(args.dataset_root)
+    if args.split != "all":
+        records = [
+            r for r in records
+            if assign_split(r.record_id, args.train_frac, args.val_frac) == args.split
+        ]
+        print(f"Filtered to '{args.split}' split: {len(records)} records")
+
     examples = convert(records, mask_recon_tokens=args.mask_recon_tokens)
 
     with open(args.output, "w", encoding="utf-8") as f:

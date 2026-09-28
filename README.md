@@ -77,3 +77,70 @@ python eval/zero_shot_eval.py \
     --data data/test_gliner.jsonl \
     --model urchade/gliner_multi_pii-v1
 ```
+
+## Data cleaning (confirmed, data-driven)
+
+Out of ~400 distinct header keys in the real dataset, only 31 ever carry a
+RECON_ token (see `data/analyze_pii_bearing_fields.py`, output committed at
+`configs/productive_header_keys.json`). `antshield_loader.py` now only
+includes those 31 header keys plus the always-productive top-level fields
+(`uri`, `post_body`, `user_agent`, `referrer`). This alone drops the median
+record from bloated boilerplate down to a fraction of GLiNER's 384-token
+limit -- but see the next section, word count is not token count here.
+
+Regenerate the whitelist if you get a newer dataset dump:
+```bash
+python data/analyze_pii_bearing_fields.py --dataset-root /path/to/antshield_public_dataset
+```
+
+## Truncation: the real cause and the fix
+
+Naive word-count is misleading for this data: `post_body` fields are dense
+JSON, and GLiNER's tokenizer treats every `{`, `"`, `:`, `,` as its own
+token. A packet with 15 words can tokenize to 150+ tokens. Measured on the
+real dataset (after header cleaning): median 74 tokens, p90 314, but **5.5%
+of records exceed GLiNER's 384-token limit** -- including ~1,050
+crash-report/stack-trace-style packets that run 2,000-16,000+ tokens.
+
+Two separate fixes, for the two separate places truncation happens:
+
+- **Eval** (`eval/chunking.py`): character-based sliding window over
+  `predict_entities`, merges overlapping predictions back to global offsets.
+  Used automatically by `eval/zero_shot_eval.py`.
+- **Fine-tuning data** (`data/prepare_finetune_data.py`): token-based
+  windowing using GLiNER's own tokenization regex (verified from source, not
+  guessed), so char-span entities convert to token-span entities correctly.
+  Caps windows-per-record at 3 (prioritizing windows that contain an entity)
+  so the ~1,050 stack-trace outliers don't balloon into 50+ near-duplicate
+  windows each and dominate the training set.
+
+## Phase 1: fine-tuning
+
+```bash
+python data/prepare_finetune_data.py \
+    --dataset-root /path/to/antshield_public_dataset \
+    --output-dir data \
+    --mask-recon-tokens
+# writes data/train_finetune.jsonl, val_finetune.jsonl, test_finetune.jsonl
+# (token-indexed format -- NOT the same schema as test_gliner.jsonl above,
+#  which is char-offset and used only by zero_shot_eval.py)
+
+pip install "gliner[training]"
+
+python train/finetune_gliner.py \
+    --data-dir data \
+    --base-model urchade/gliner_multi_pii-v1 \
+    --output-dir models/antshield-gliner-v1
+```
+
+To evaluate any checkpoint (baseline or fine-tuned) on the held-out test
+split, generate the char-offset eval file with `--split test` (uses the same
+hash split as `*_finetune.jsonl`, so no train/test leakage):
+```bash
+python data/convert_to_gliner_format.py \
+    --dataset-root /path/to/antshield_public_dataset \
+    --output data/test_gliner.jsonl --mask-recon-tokens --split test
+
+python eval/zero_shot_eval.py --data data/test_gliner.jsonl --model models/antshield-gliner-v1
+```
+(`--model` accepts a local path -- GLiNER's `from_pretrained` handles both.)
