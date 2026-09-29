@@ -28,21 +28,21 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pii_type_mapping import ANTSHIELD_TO_GLINER_LABEL, RAW_TYPES_BY_LENGTH  # noqa: E402
+from pii_type_mapping import build_recon_pattern, extract_recon_label  # noqa: E402
 from antshield_loader import load_antshield_dataset, PacketRecord  # noqa: E402
 from recon_synthesizer import synthesize  # noqa: E402
-from splitting import assign_split  # noqa: E402
+from splitting import assign_split, assign_split_campaign  # noqa: E402
 
-# alternation ordered longest-first so e.g. "AndroidId" can't be cut short by
-# a shorter type name that happens to be a prefix; also correctly separates
-# adjacent tokens with no delimiter, e.g. "RECON_SerialNumberRECON_AndroidId"
-_RECON_PATTERN = re.compile("RECON_(" + "|".join(RAW_TYPES_BY_LENGTH) + ")")
+# see pii_type_mapping.build_recon_pattern's docstring: absorbs trailing
+# junk suffixes (digit IDs, base64-ish device strings) as part of the span,
+# with a guard against merging into a directly-adjacent second token
+_RECON_PATTERN = build_recon_pattern()
 
 
 def find_recon_spans(text: str):
-    """Yields (start, end, raw_type) for every RECON_<Type> token in text, in order."""
+    """Yields (start, end, gliner_label) for every RECON_<Type>[suffix] token in text, in order."""
     for m in _RECON_PATTERN.finditer(text):
-        yield m.start(), m.end(), m.group(1)
+        yield m.start(), m.end(), extract_recon_label(m.group(0))
 
 
 def convert_record(record: PacketRecord, mask_recon_tokens: bool):
@@ -50,10 +50,7 @@ def convert_record(record: PacketRecord, mask_recon_tokens: bool):
     matches = list(find_recon_spans(text))
 
     if not mask_recon_tokens:
-        entities = [
-            {"start": s, "end": e, "label": ANTSHIELD_TO_GLINER_LABEL[raw_type]}
-            for s, e, raw_type in matches
-        ]
+        entities = [{"start": s, "end": e, "label": label} for s, e, label in matches]
         return {"text": text, "entities": entities}
 
     # rebuild the string, replacing each token with a synthesized value and
@@ -61,9 +58,8 @@ def convert_record(record: PacketRecord, mask_recon_tokens: bool):
     out_parts = []
     entities = []
     cursor = 0
-    for i, (s, e, raw_type) in enumerate(matches):
+    for i, (s, e, label) in enumerate(matches):
         out_parts.append(text[cursor:s])
-        label = ANTSHIELD_TO_GLINER_LABEL[raw_type]
         replacement = synthesize(label, seed_key=f"{record.record_id}:{i}")
         new_start = sum(len(p) for p in out_parts)
         out_parts.append(replacement)
@@ -112,24 +108,43 @@ def main():
         "--split",
         choices=["train", "val", "test", "all"],
         default="all",
-        help="filter to one split using the same record_id hashing as "
-             "prepare_finetune_data.py, so this eval-format file and that "
-             "script's *_finetune.jsonl agree on which records are 'test' "
-             "(default 'all' -- fine for a pure zero-shot run with no "
-             "fine-tuning to leak against, but use 'test' when evaluating a "
-             "fine-tuned checkpoint)",
+        help="filter to one split (default 'all' -- fine for a pure "
+             "zero-shot run with nothing to leak against, but use 'test' "
+             "when evaluating a fine-tuned checkpoint, matching whichever "
+             "--split-strategy that checkpoint was trained under)",
+    )
+    ap.add_argument(
+        "--split-strategy",
+        choices=["campaign", "hash"],
+        default="campaign",
+        help="'campaign' (default): auto_anteater=train, manual_anteater=test "
+             "-- matches the reference binary-BERT model's split exactly, so "
+             "GLiNER's test set is the SAME test set that model was scored "
+             "on. 'hash': random per-record split, use only if you "
+             "specifically want a non-campaign-correlated split instead.",
     )
     ap.add_argument("--train-frac", type=float, default=0.7)
     ap.add_argument("--val-frac", type=float, default=0.15)
+    ap.add_argument(
+        "--include-metadata-fields",
+        action="store_true",
+        help="add package_name (normalized) + platform/protocol/method/domain/"
+             "host/dst_ip/dst_port/package_version/is_foreground as ambient "
+             "context, matching the reference BERT script's feature set. "
+             "None of these carry a RECON_ token, so no entity-span risk -- "
+             "just extra tokens. Off by default.",
+    )
     args = ap.parse_args()
 
-    records = load_antshield_dataset(args.dataset_root)
+    records = load_antshield_dataset(args.dataset_root, include_metadata=args.include_metadata_fields)
     if args.split != "all":
-        records = [
-            r for r in records
-            if assign_split(r.record_id, args.train_frac, args.val_frac) == args.split
-        ]
-        print(f"Filtered to '{args.split}' split: {len(records)} records")
+        split_fn = (
+            (lambda rid: assign_split_campaign(rid))
+            if args.split_strategy == "campaign"
+            else (lambda rid: assign_split(rid, args.train_frac, args.val_frac))
+        )
+        records = [r for r in records if split_fn(r.record_id) == args.split]
+        print(f"Filtered to '{args.split}' split ({args.split_strategy} strategy): {len(records)} records")
 
     examples = convert(records, mask_recon_tokens=args.mask_recon_tokens)
 

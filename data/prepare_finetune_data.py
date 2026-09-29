@@ -23,13 +23,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from pii_type_mapping import ANTSHIELD_TO_GLINER_LABEL, RAW_TYPES_BY_LENGTH  # noqa: E402
+from pii_type_mapping import build_recon_pattern, extract_recon_label  # noqa: E402
 from antshield_loader import load_antshield_dataset, PacketRecord  # noqa: E402
 from recon_synthesizer import synthesize  # noqa: E402
 from gliner_tokenizer import tokenize_with_offsets, char_span_to_token_span  # noqa: E402
-from splitting import assign_split  # noqa: E402
+from splitting import assign_split, assign_split_campaign  # noqa: E402
 
-_RECON_PATTERN = re.compile("RECON_(" + "|".join(RAW_TYPES_BY_LENGTH) + ")")
+_RECON_PATTERN = build_recon_pattern()
 
 
 def build_char_entities(text: str, mask_recon_tokens: bool, seed_prefix: str):
@@ -39,7 +39,7 @@ def build_char_entities(text: str, mask_recon_tokens: bool, seed_prefix: str):
 
     if not mask_recon_tokens:
         entities = [
-            (m.start(), m.end(), ANTSHIELD_TO_GLINER_LABEL[m.group(1)]) for m in matches
+            (m.start(), m.end(), extract_recon_label(m.group(0))) for m in matches
         ]
         return text, entities
 
@@ -48,7 +48,7 @@ def build_char_entities(text: str, mask_recon_tokens: bool, seed_prefix: str):
     cursor = 0
     for i, m in enumerate(matches):
         out_parts.append(text[cursor:m.start()])
-        label = ANTSHIELD_TO_GLINER_LABEL[m.group(1)]
+        label = extract_recon_label(m.group(0))
         replacement = synthesize(label, seed_key=f"{seed_prefix}:{i}")
         new_start = sum(len(p) for p in out_parts)
         out_parts.append(replacement)
@@ -123,11 +123,29 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=300, help="window size, kept under GLiNER's 384 limit")
     ap.add_argument("--overlap-tokens", type=int, default=30)
     ap.add_argument("--max-windows-per-record", type=int, default=3)
+    ap.add_argument(
+        "--split-strategy",
+        choices=["campaign", "hash"],
+        default="campaign",
+        help="'campaign' (default): auto_anteater=train (minus a val "
+             "carve-out), manual_anteater=test -- matches the reference "
+             "binary-BERT model's split. 'hash': random per-record split.",
+    )
     ap.add_argument("--train-frac", type=float, default=0.7)
     ap.add_argument("--val-frac", type=float, default=0.15)
+    ap.add_argument(
+        "--include-metadata-fields",
+        action="store_true",
+        help="see convert_to_gliner_format.py --help -- same flag, same fields.",
+    )
     args = ap.parse_args()
 
-    records = load_antshield_dataset(args.dataset_root)
+    records = load_antshield_dataset(args.dataset_root, include_metadata=args.include_metadata_fields)
+    split_fn = (
+        (lambda rid: assign_split_campaign(rid, args.val_frac))
+        if args.split_strategy == "campaign"
+        else (lambda rid: assign_split(rid, args.train_frac, args.val_frac))
+    )
 
     splits = {"train": [], "val": [], "test": []}
     total_dropped = 0
@@ -140,7 +158,7 @@ def main():
         )
         total_dropped += dropped
 
-        split_name = assign_split(r.record_id, args.train_frac, args.val_frac)
+        split_name = split_fn(r.record_id)
 
         for w in windows:
             if w["ner"]:

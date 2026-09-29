@@ -36,6 +36,40 @@ ANTSHIELD_TO_GLINER_LABEL = {
 # can't be short-circuited by a shorter one that happens to be a prefix
 RAW_TYPES_BY_LENGTH = sorted(ANTSHIELD_TO_GLINER_LABEL.keys(), key=len, reverse=True)
 
+import re as _re
+
+
+def build_recon_pattern():
+    """
+    Matches a full RECON_<Type> redaction token INCLUDING any trailing
+    junk AntShield's own tooling appended to it -- confirmed by direct scan:
+    ~5,300 tokens have suffixes like "RECON_Location841329" (digit suffix,
+    5105 of these) or "RECON_AdvertiserId___Y29tLnFpaG9vLnNlY3VyaXR5..."
+    (base64-ish device string). Absorbing the whole thing as one entity span
+    is the correct call, not a bug to route around: that suffix occupies the
+    space the real PII value used to sit in, in AntShield's own scheme.
+
+    The (?!RECON_) guard matters for the ~57 records where two redactions
+    are concatenated with zero separator, e.g.
+    "RECON_SerialNumberRECON_AndroidId" -- without the guard, greedy suffix
+    consumption would eat straight through the second token's "RECON_"
+    prefix and merge both into one garbage match (this is exactly the bug
+    in the reference BERT preprocessing script's plain
+    `RECON_[A-Za-z0-9]*`, which leaves a bare "_AndroidId" behind, minus its
+    RECON_ prefix, in 57 real records).
+    """
+    types = "|".join(RAW_TYPES_BY_LENGTH)
+    return _re.compile(rf"RECON_(?:{types})(?:(?!RECON_)[A-Za-z0-9_])*")
+
+
+def extract_recon_label(token: str) -> str:
+    """Given a full matched token (e.g. 'RECON_Location841329'), returns the
+    GLiNER label for its base type."""
+    for raw_type in RAW_TYPES_BY_LENGTH:
+        if token.startswith(f"RECON_{raw_type}"):
+            return ANTSHIELD_TO_GLINER_LABEL[raw_type]
+    raise KeyError(f"Could not extract a known type from token '{token}'")
+
 
 def normalize_type(raw_type: str) -> str:
     if raw_type in ANTSHIELD_TO_GLINER_LABEL:

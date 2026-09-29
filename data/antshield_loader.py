@@ -30,6 +30,19 @@ from typing import List, Optional
 
 _DEFAULT_PRODUCTIVE_HEADERS_PATH = Path(__file__).resolve().parent.parent / "configs" / "productive_header_keys.json"
 
+# From the reference binary-BERT preprocessing script: these two values are
+# unresolved app-ID lookups from AntShield's own collection tooling, not real
+# package identifiers. Bucketed into one canonical token rather than left as
+# literal junk strings, matching that script's documented reasoning (the
+# junk string correlates with a real, if modest, shift in label rate).
+_JUNK_PACKAGE_NAMES = {"No mapping_ entry not found", "System"}
+
+
+def normalize_package_name(pkg: Optional[str]) -> str:
+    if pkg in _JUNK_PACKAGE_NAMES:
+        return "unknown_package"
+    return pkg or ""
+
 
 def _load_productive_headers(path=_DEFAULT_PRODUCTIVE_HEADERS_PATH) -> Optional[set]:
     """
@@ -61,7 +74,13 @@ class PacketRecord:
     protocol: str = ""
 
 
-def _extract_text(packet: dict, productive_headers: Optional[set]) -> str:
+_METADATA_FIELDS = (
+    "platform", "protocol", "method", "package_version",
+    "domain", "host", "dst_ip", "dst_port", "is_foreground",
+)
+
+
+def _extract_text(packet: dict, productive_headers: Optional[set], include_metadata: bool) -> str:
     """
     Concatenate every field confirmed (by direct scan) to carry PII, each
     prefixed with a tag so you can tell where a match came from if you inspect
@@ -70,8 +89,28 @@ def _extract_text(packet: dict, productive_headers: Optional[set]) -> str:
 
     productive_headers: lowercased set of header keys worth including
     (from analyze_pii_bearing_fields.py). None means include all headers.
+
+    include_metadata: adds package_name (normalized) plus platform/protocol/
+    method/domain/host/dst_ip/dst_port/package_version/is_foreground as
+    ambient context, matching the reference BERT script's feature set. None
+    of these fields have ever been observed to carry a RECON_ token (verified
+    by direct scan), so they add no entity-span risk -- just extra tokens.
+    Off by default: BERT's binary task benefits from any correlated signal;
+    GLiNER's span-extraction task doesn't have a target in these fields, and
+    they eat into the 384-token budget for comparatively little benefit. Turn
+    this on for closer feature-parity with the BERT experiment.
     """
     pieces = []
+
+    if include_metadata:
+        pkg = normalize_package_name(packet.get("package_name"))
+        if pkg:
+            pieces.append(f"package_name: {pkg}")
+        for field_name in _METADATA_FIELDS:
+            val = packet.get(field_name)
+            if val not in (None, ""):
+                pieces.append(f"{field_name}: {val}")
+
     for field_name in ("uri", "post_body", "user_agent", "referrer"):
         val = packet.get(field_name)
         if val:
@@ -88,10 +127,11 @@ def _extract_text(packet: dict, productive_headers: Optional[set]) -> str:
     return " | ".join(pieces)
 
 
-def load_antshield_dataset(dataset_root: str) -> List[PacketRecord]:
+def load_antshield_dataset(dataset_root: str, include_metadata: bool = False) -> List[PacketRecord]:
     """
     dataset_root: path to the extracted antshield_public_dataset/ folder
     (the one directly containing raw_data/, exposures.csv, apps_info.csv).
+    include_metadata: see _extract_text's docstring.
     """
     pattern = os.path.join(dataset_root, "raw_data", "**", "*.json")
     files = glob.glob(pattern, recursive=True)
@@ -116,10 +156,10 @@ def load_antshield_dataset(dataset_root: str) -> List[PacketRecord]:
             records.append(
                 PacketRecord(
                     record_id=f"{fp}::{key}",
-                    text=_extract_text(packet, productive_headers),
+                    text=_extract_text(packet, productive_headers, include_metadata),
                     label=int(packet.get("label", 0)),
                     pii_types=list(packet.get("pii_types") or []),
-                    package_name=packet.get("package_name", ""),
+                    package_name=normalize_package_name(packet.get("package_name")),
                     protocol=packet.get("protocol", ""),
                 )
             )

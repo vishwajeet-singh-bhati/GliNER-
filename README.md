@@ -144,3 +144,53 @@ python data/convert_to_gliner_format.py \
 python eval/zero_shot_eval.py --data data/test_gliner.jsonl --model models/antshield-gliner-v1
 ```
 (`--model` accepts a local path -- GLiNER's `from_pretrained` handles both.)
+
+## Incorporated from the reference BERT preprocessing script
+
+Cross-checked `preprocess_antshield.py` (the script used for the binary BERT
+model) against the real dataset. Three real fixes came out of this:
+
+1. **Split now matches the BERT model's test set exactly, by default.**
+   `--split-strategy campaign` (now the default in both converters):
+   `auto_anteater` -> train/val, `manual_anteater` -> test. Verified against
+   the BERT script's own reported counts: test = {0: 21370, 1: 3819} (manual_anteater
+   exactly), train+val = {0: 17127, 1: 4760} (auto_anteater exactly). This is
+   what makes a GLiNER-vs-BERT comparison meaningful -- my earlier hash-based
+   split was scoring GLiNER against a different test set than BERT was scored on.
+
+   Known caveat, carried over verbatim because it applies identically here
+   (documented in `splitting.py`): this is a split by collection campaign,
+   not by app -- 73 package names appear in both campaigns (~71.6% of test
+   packages also in train), so test metrics are likely somewhat optimistic
+   relative to a genuinely unseen-app scenario. Use `--split-strategy hash`
+   for a non-campaign-correlated split if that matters for your purposes.
+
+2. **RECON_ token matching now absorbs trailing suffixes correctly.**
+   ~5,300 redaction tokens have junk after the type name (`RECON_Location841329`,
+   base64-ish device strings). My regex was previously stopping right after the
+   type name and leaving that suffix glued onto the synthetic replacement value
+   in masked mode (verified and fixed -- 0 residual `RECON_` substrings, 0
+   glued-garbage entities after the fix, checked across the full test split).
+   `data/pii_type_mapping.py`'s `build_recon_pattern()` is now the single
+   source of truth for this regex, used by both converters.
+
+3. **package_name normalization + optional metadata fields.**
+   `"No mapping_ entry not found"` / `"System"` -> `unknown_package`,
+   matching the BERT script's bucketing. Available via
+   `--include-metadata-fields` (off by default -- these fields never carry a
+   RECON_ token, so they're pure context for GLiNER's span task, not
+   something worth spending token budget on by default; turn on for closer
+   feature-parity with the BERT experiment).
+
+One finding surfaced but NOT fixed here since it's in the other repo: the
+reference script's `RECON_[A-Za-z0-9]*` regex has no `_` in its character
+class, so on the ~57 records with concatenated tokens
+(`RECON_SerialNumberRECON_AndroidId`) it merges into the second token's
+`RECON_` prefix and leaves a bare `_AndroidId` in the BERT training text --
+a residual version of the exact leakage problem that script's own docstring
+warns about, just for the binary task instead of the type task.
+
+Also confirmed, not changed: the BERT script's 2000-char post_body truncation
+drops ~476 RECON_ tokens across train+test (213 auto, 263 manual) as false
+negatives. This pipeline's sliding-window chunking (see above) doesn't have
+that failure mode.
