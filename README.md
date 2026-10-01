@@ -130,8 +130,15 @@ pip install "gliner[training]"
 python train/finetune_gliner.py \
     --data-dir data \
     --base-model urchade/gliner_multi_pii-v1 \
-    --output-dir models/antshield-gliner-v1
+    --output-dir models/antshield-gliner-v1 \
+    --batch-size 2 --grad-accum 4 --max-steps 300
 ```
+
+Batch size defaults to 2 with 4x gradient accumulation (effective batch 8) and fp16
+on by default -- `max_width` (the model's span-enumeration width) is fixed by the
+pretrained checkpoint's architecture and can't be lowered to save memory without
+breaking weight compatibility, so batch size/precision are the real levers here.
+If you still hit CUDA OOM, drop `--batch-size` to 1 before raising `--grad-accum`.
 
 To evaluate any checkpoint (baseline or fine-tuned) on the held-out test
 split, generate the char-offset eval file with `--split test` (uses the same
