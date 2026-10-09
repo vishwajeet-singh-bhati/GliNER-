@@ -1,7 +1,23 @@
+# Environments
 .venv/
 __pycache__/
-*.pyc
-data/*.jsonl
-data/sample_raw.json
+*.py[cod]
+*$py.class
+
+# Deep Learning Models & Weights
+models/
+*.bin
+*.safetensors
 *.pt
-*.onnx
+*.pth
+
+# Large Datasets
+data/*.jsonl
+data/*.bak
+data/*.csv
+
+# Logs
+wandb/
+.DS_Store
+*.zip
+*.tar.gz
