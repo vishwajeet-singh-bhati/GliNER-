@@ -30,12 +30,51 @@ def spans_match(pred, gold):
     return pred["start"] == gold["start"] and pred["end"] == gold["end"] and pred["label"] == gold["label"]
 
 
+def _normalise_example(ex: dict) -> dict:
+    """
+    Accept either schema produced by this pipeline:
+      A) char-level:  {"text": str, "entities": [{"start":int,"end":int,"label":str},...]}
+         -> produced by convert_to_gliner_format.py / used by zero_shot_eval
+      B) token-level: {"tokenized_text": [str,...], "ner": [[s,e,label],...]}
+         -> produced by prepare_finetune_data.py / used by finetune_gliner
+
+    For schema B, reconstruct a char-level string by joining tokens with spaces
+    and convert token-index spans to char spans. This is an approximation
+    (a space is inserted between every token regardless of original spacing),
+    but it is consistent and reversible within the same eval run.
+    """
+    if "text" in ex:
+        return ex  # schema A — nothing to do
+
+    tokens = ex.get("tokenized_text", [])
+    text = " ".join(tokens)
+
+    # build char offsets: token i starts at sum(len(t)+1 for t in tokens[:i])
+    offsets = []
+    pos = 0
+    for t in tokens:
+        offsets.append(pos)
+        pos += len(t) + 1  # +1 for the space separator
+
+    entities = []
+    for span in ex.get("ner", []):
+        s_tok, e_tok, label = span[0], span[1], span[2]
+        if s_tok >= len(offsets) or e_tok >= len(offsets):
+            continue
+        char_start = offsets[s_tok]
+        char_end = offsets[e_tok] + len(tokens[e_tok])  # inclusive end → exclusive
+        entities.append({"start": char_start, "end": char_end, "label": label})
+
+    return {"text": text, "entities": entities}
+
+
 def evaluate(model, examples, labels, threshold=0.5, verbose=True):
     tp = defaultdict(int)
     fp = defaultdict(int)
     fn = defaultdict(int)
 
-    for ex in examples:
+    for raw_ex in examples:
+        ex = _normalise_example(raw_ex)
         text = ex["text"]
         gold_entities = ex["entities"]
 

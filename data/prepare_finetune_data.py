@@ -75,7 +75,15 @@ def chunk_and_tokenize(text: str, char_entities, max_tokens: int, overlap_tokens
     the one that gets dropped."""
     tokens = tokenize_with_offsets(text)
     if not tokens:
-        return [{"tokenized_text": [], "ner": []}], 0
+        if char_entities:
+            import sys
+            print(
+                f"[warn] chunk_and_tokenize: text tokenized to 0 tokens but has "
+                f"{len(char_entities)} entity span(s) — dropping all of them. "
+                f"Text repr: {text!r:.80}",
+                file=sys.stderr,
+            )
+        return [], 0
 
     dropped = 0
     windows = []

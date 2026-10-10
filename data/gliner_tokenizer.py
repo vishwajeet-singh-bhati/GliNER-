@@ -35,7 +35,7 @@ def char_span_to_token_span(
     for i, (_, tok_start, tok_end) in enumerate(tokens):
         if start_idx is None and tok_start <= char_start < tok_end:
             start_idx = i
-        if tok_start < char_end <= tok_end:
+        if tok_start <= char_end - 1 < tok_end:  # [start,end) span: end token contains char_end-1
             end_idx = i
     if start_idx is None or end_idx is None or end_idx < start_idx:
         return None

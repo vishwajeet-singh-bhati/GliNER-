@@ -303,7 +303,8 @@ class E8QATLinear(nn.Module):
         k = (_OPT_STEP[0], self.weight._version, self.weight.device, self.weight.dtype,
              self.weight.shape)
         if self.scaling_mode == "row_sigma_learnable":
-            k += (self.theta_beta._version, self.sigma_ema._version)
+            k += (getattr(self.theta_beta, "_version", 0),
+                  getattr(self.sigma_ema, "_version", 0))
         return k
 
     # ------------------------------------------------------ learnable-mode helpers

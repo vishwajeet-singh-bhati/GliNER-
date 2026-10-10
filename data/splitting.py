@@ -15,7 +15,7 @@ def split_bucket(record_id: str) -> float:
     stable across runs and across processes, unlike Python's randomized
     str hash."""
     digest = hashlib.md5(record_id.encode("utf-8")).hexdigest()
-    return int(digest[:8], 16) / 0xFFFFFFFF
+    return int(digest[:8], 16) / 0x100000000  # 2^32: guarantees bucket is in [0, 1)
 
 
 def assign_split(record_id: str, train_frac: float = 0.7, val_frac: float = 0.15) -> str:

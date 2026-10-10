@@ -23,8 +23,11 @@ def main():
     ap.add_argument("--base-model", default="urchade/gliner_multi_pii-v1")
     ap.add_argument("--output-dir", default="models/antshield-gliner-v1")
     ap.add_argument("--max-steps", type=int, default=2000)
-    ap.add_argument("--learning-rate", type=float, default=2e-5)
-    ap.add_argument("--weight-decay", type=float, default=0.0)
+    ap.add_argument("--learning-rate", type=float, default=5e-6,
+                    help="Peak LR. Default 5e-6 is safe for gliner_multi_pii-v1 which is "
+                         "already PII-specialized. 2e-5 causes catastrophic overfitting.")
+    ap.add_argument("--weight-decay", type=float, default=0.01,
+                    help="AdamW weight decay. 0.01 prevents memorisation on small datasets.")
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--grad-accum", type=int, default=8)
     ap.add_argument("--max-types", type=int, default=4)

@@ -38,7 +38,7 @@ def quantize_gliner_encoder(gliner_model, scaling_mode: str = "block_max", learn
 
 def load_quantized_gliner(base_model_name: str, checkpoint_dir: str, scaling_mode: str = "block_max", learnable: bool = True, min_features: int = 64):
     from gliner import GLiNER
-    model = GLiNER.from_pretrained(base_model_name)
+    model = GLiNER.from_pretrained(base_model_name, local_files_only=True)
     n = quantize_gliner_encoder(model, scaling_mode=scaling_mode, learnable=learnable, min_features=min_features)
     print(f"Reconstructed quantized architecture ({n} layers) before loading checkpoint weights")
     
