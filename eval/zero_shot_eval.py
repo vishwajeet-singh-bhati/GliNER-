@@ -110,18 +110,21 @@ def evaluate(model, examples, labels, threshold=0.5, verbose=True):
         
     all_labels = sorted(set(tp) | set(fp) | set(fn))
     macro_f1 = []
+    sup_f1 = []
     for label in all_labels:
         p = tp[label] / (tp[label] + fp[label]) if (tp[label] + fp[label]) else 0.0
         r = tp[label] / (tp[label] + fn[label]) if (tp[label] + fn[label]) else 0.0
         f1 = 2 * p * r / (p + r) if (p + r) else 0.0
         support = tp[label] + fn[label]
         macro_f1.append(f1)
+        if support > 0: sup_f1.append(f1)
         if verbose:
             print(f"{label:<25}{p:>8.3f}{r:>8.3f}{f1:>8.3f}{support:>10}")
 
     overall_macro_f1 = sum(macro_f1) / len(macro_f1) if macro_f1 else 0.0
     if verbose:
         print(f"\nMacro F1: {overall_macro_f1:.3f}")
+        print(f"Macro F1 (support>0, {len(sup_f1)} labels): {sum(sup_f1)/max(1,len(sup_f1)):.3f}")
     return overall_macro_f1
 
 

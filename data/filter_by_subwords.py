@@ -4,7 +4,7 @@ import shutil
 
 def load_tokenizer(path):
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(path, local_files_only=True)
+    return AutoTokenizer.from_pretrained(path, local_files_only=False)
 
 def subword_lengths(tokenizer, windows, batch=128):
     lengths = []

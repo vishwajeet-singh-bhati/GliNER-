@@ -308,6 +308,13 @@ class E8QATLinear(nn.Module):
         return k
 
     # ------------------------------------------------------ learnable-mode helpers
+    def _cache_stale(self, key):
+        if (not E8_CACHE_ENABLED) or self._q_cache is None or self._q_cache_key != key:
+            return True
+        # A cache built under torch.inference_mode() is an inference tensor and
+        # cannot be saved for backward. Rebuild it once when we leave inference mode.
+        return self._q_cache.is_inference() and not torch.is_inference_mode_enabled()
+
     def _gather_stats(self):
         with torch.no_grad():
             m = LEARNABLE_EMA_MOMENTUM
@@ -343,7 +350,7 @@ class E8QATLinear(nn.Module):
         W_scaled = W * beta
 
         key = self._version_key()
-        if (not E8_CACHE_ENABLED) or self._q_cache is None or self._q_cache_key != key:
+        if self._cache_stale(key):
             self._q_cache = self._learnable_quantize_scaled(W_scaled.detach())
             self._q_cache_key = key
 
@@ -357,7 +364,7 @@ class E8QATLinear(nn.Module):
             return self._forward_learnable(x)
 
         key = self._version_key()
-        if (not E8_CACHE_ENABLED) or self._q_cache is None or self._q_cache_key != key:
+        if self._cache_stale(key):
             with torch.no_grad():
                 self._q_cache = e8_quantize_ste(self.weight.detach(), self.codebook,
                                                   self.norms, self.scaling_mode)

@@ -21,3 +21,5 @@ wandb/
 .DS_Store
 *.zip
 *.tar.gz
+
+antshield_public_dataset/
