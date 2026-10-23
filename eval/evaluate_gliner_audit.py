@@ -21,6 +21,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -691,6 +692,106 @@ def classify_errors(gold: Set[Tuple[int, int, str]], pred: Set[Tuple[int, int, s
     return errs, ef_by_label
 
 
+def explain_errors(gold: Set[Tuple[int, int, str]], pred: Set[Tuple[int, int, str]]):
+    """Yields (side, kind, span) for every error of one window (same taxonomy as classify_errors)."""
+    def overlaps(a, b):
+        return a[0] <= b[1] and b[0] <= a[1]
+
+    for p_ in sorted(pred - gold):
+        if any((g[0], g[1]) == (p_[0], p_[1]) for g in gold):
+            kind = "label_confusion"
+        elif any(g[2] == p_[2] and overlaps(g, p_) for g in gold):
+            kind = "boundary_same_label"
+        elif any(overlaps(g, p_) for g in gold):
+            kind = "overlaps_gold_other_label"
+        elif not gold:
+            kind = "in_entity_free_window"
+        else:
+            kind = "spurious_in_positive_window"
+        yield "FP", kind, p_
+    for g in sorted(gold - pred):
+        if any((q[0], q[1]) == (g[0], g[1]) for q in pred):
+            kind = "label_confusion"
+        elif any(q[2] == g[2] and overlaps(g, q) for q in pred):
+            kind = "boundary"
+        else:
+            kind = "missed"
+        yield "FN", kind, g
+
+
+_ID_LIKE = re.compile(r"[0-9A-Za-z_-]{12,}")
+
+
+def _norm_ctx(tokens: Sequence[str]) -> str:
+    out = []
+    for t in tokens:
+        if _ID_LIKE.fullmatch(t) and re.search(r"\d", t):
+            out.append("<ID>")
+        else:
+            out.append(re.sub(r"\d", "0", t))
+    return " ".join(out)
+
+
+def build_error_report(store, threshold: float, top_groups: int = 60, samples_per_group: int = 3):
+    """Groups errors by (side, kind, label, left-context) so one repeated template shows up as ONE row.
+    Values in this dataset are synthetic stand-ins for the redacted real ones; contexts are traffic text."""
+    from collections import defaultdict
+    groups: Dict[Tuple[str, str, str, str], Dict[str, Any]] = defaultdict(lambda: {"count": 0, "windows": set(), "samples": []})
+    for wi, rec in enumerate(store):
+        gold, scored, _ov = rec[0], rec[1], rec[2]
+        tokens = rec[3] if len(rec) > 3 else None
+        if tokens is None:
+            continue
+        triples = {(s_, e_, l_) for s_, e_, l_, sc in scored if sc >= threshold}
+        score_of = {(s_, e_, l_): sc for s_, e_, l_, sc in scored}
+        for side, kind, (s_, e_, l_) in explain_errors(set(gold), triples):
+            key = (side, kind, l_, _norm_ctx(tokens[max(0, s_ - 3):s_]))
+            g = groups[key]
+            g["count"] += 1
+            g["windows"].add(wi)
+            if len(g["samples"]) < samples_per_group:
+                g["samples"].append({
+                    "window": wi, "score": round(score_of.get((s_, e_, l_), 0.0), 4),
+                    "left": " ".join(tokens[max(0, s_ - 6):s_]), "span": " ".join(tokens[s_:e_ + 1]),
+                    "right": " ".join(tokens[e_ + 1:e_ + 4]),
+                })
+    ranked = sorted(groups.items(), key=lambda kv: -kv[1]["count"])
+    rows = [{"side": k[0], "kind": k[1], "label": k[2], "left_context": k[3], "count": v["count"],
+             "windows": len(v["windows"])} for k, v in ranked[:top_groups]]
+    samples = [{"side": k[0], "kind": k[1], "label": k[2], "left_context": k[3], "count": v["count"],
+                "examples": v["samples"]} for k, v in ranked[:top_groups]]
+    total = sum(v["count"] for v in groups.values())
+    top10 = sum(v["count"] for _, v in ranked[:10])
+    return rows, samples, {"total_errors": total, "distinct_groups": len(groups), "top10_groups_share": round(top10 / max(1, total), 4)}
+
+
+def select_threshold(store, grid: Sequence[float], target_positive_rate: Optional[float] = None):
+    """Best-micro-F1 threshold over `grid`.  With target_positive_rate, entity-free windows are weighted so
+    the validation mix has that share of windows with PII (prior-shift correction: precision depends on
+    the mix, and the validation file is much more positive-heavy than real traffic)."""
+    n_pos = sum(1 for rec in store if rec[0])
+    n_neg = len(store) - n_pos
+    w_neg = 1.0
+    if target_positive_rate and 0 < target_positive_rate < 1 and n_pos and n_neg:
+        w_neg = ((1 - target_positive_rate) / target_positive_rate) / (n_neg / n_pos)
+    table = {}
+    for t in grid:
+        tp = fp = fn = 0.0
+        for rec in store:
+            gold, scored = set(rec[0]), rec[1]
+            pred = {(s_, e_, l_) for s_, e_, l_, sc in scored if sc >= t}
+            w = 1.0 if gold else w_neg
+            tp += w * len(gold & pred)
+            fp += w * len(pred - gold)
+            fn += w * len(gold - pred)
+        p = tp / (tp + fp) if tp + fp else 0.0
+        r = tp / (tp + fn) if tp + fn else 0.0
+        table[f"{t:g}"] = {"precision": round(p, 6), "recall": round(r, 6),
+                           "f1": round(2 * p * r / (p + r), 6) if p + r else 0.0}
+    best = max(table, key=lambda k: table[k]["f1"])
+    return float(best), table, w_neg
+
+
 def score_store(store, labels: List[str], threshold: float):
     """Score cached (gold, scored_preds, has_overlap) windows at `threshold`."""
     full = {l: Counter() for l in labels}
@@ -698,7 +799,8 @@ def score_store(store, labels: List[str], threshold: float):
     errors: Counter = Counter()
     ef_labels: Counter = Counter()
     n_pred_windows_entity_free = 0
-    for gold, scored, has_overlap in store:
+    for rec in store:
+        gold, scored, has_overlap = rec[0], rec[1], rec[2]
         triples = [(s_, e_, l_) for s_, e_, l_, sc in scored if sc >= threshold]
         ex_stats = match_spans_one_to_one(gold, triples, labels)
         for l in labels:
@@ -710,7 +812,7 @@ def score_store(store, labels: List[str], threshold: float):
         ef_labels.update(ef)
         if not gold and triples:
             n_pred_windows_entity_free += 1
-    n_ef = sum(1 for g, _, _ in store if not g)
+    n_ef = sum(1 for rec in store if not rec[0])
     return full, clean, errors, ef_labels, n_ef, n_pred_windows_entity_free
 
 
@@ -775,6 +877,8 @@ def evaluate_model_on_dataset(
     sweep: Optional[Sequence[float]] = None,
     batch_size: int = 1,
     max_subwords: int = 1024,
+    dump_errors: bool = False,
+    return_store: bool = False,
 ) -> Dict[str, Any]:
     """Runs the model ONCE over the windows and scores the cached predictions.
 
@@ -816,15 +920,15 @@ def evaluate_model_on_dataset(
 
     store = []
     state: Dict[str, Any] = {}
-    pending = []   # [(has_overlap, gold, [ (chunk, offsets, start_map, end_map, text) ])]
+    pending = []   # [(has_overlap, gold, [ (chunk, offsets, start_map, end_map, text) ], tokens)]
 
     def flush():
         if not pending:
             return
-        texts = [c[4] for _, _, chs in pending for c in chs]
+        texts = [c[4] for _, _, chs, _t in pending for c in chs]
         preds_all = _predict_many(model, texts, labels, flat_ner, run_threshold, multi_label, batch_size, state)
         k = 0
-        for has_overlap, gold, chs in pending:
+        for has_overlap, gold, chs, win_tokens in pending:
             window_raw: List[Tuple[int, int, str, float]] = []
             for (ch, offsets, start_map, end_map, _t) in chs:
                 for ent in preds_all[k]:
@@ -845,7 +949,7 @@ def evaluate_model_on_dataset(
             dedup = deduplicate_predictions(window_raw)
             chunk_stats["deduplicated_predictions"] += len(dedup)
             chunk_stats["duplicates_removed_across_chunks"] += len(window_raw) - len(dedup)
-            store.append((gold, dedup, has_overlap))
+            store.append((gold, dedup, has_overlap, win_tokens))
         pending.clear()
 
     t0 = time.time()
@@ -865,7 +969,7 @@ def evaluate_model_on_dataset(
                     chunk_stats["single_tokens_exceeding_budget"] += 1
                 ch_text, offsets, start_map, end_map = build_chunk_string_and_offsets(tokens[ch.start_tok: ch.end_tok + 1])
                 chs.append((ch, offsets, start_map, end_map, ch_text))
-            pending.append((has_overlap, gold_spans, chs))
+            pending.append((has_overlap, gold_spans, chs, tokens))
             if len(pending) >= max(1, batch_size):
                 flush()
 
@@ -895,6 +999,11 @@ def evaluate_model_on_dataset(
         "entity_free_windows": n_ef,
         "entity_free_windows_with_a_prediction": n_ef_with_pred,
     }
+    if dump_errors:
+        rows, samples, summ = build_error_report(store, threshold)
+        out["error_groups"], out["error_samples"], out["error_groups_summary"] = rows, samples, summ
+    if return_store:
+        out["_store"] = store
     if sweep:
         table = {}
         for t in sweep:
@@ -1004,6 +1113,12 @@ def main():
                     help="Fixed confidence threshold.  Default: selected on --val-path if given, else 0.5.")
     ap.add_argument("--sweep", default="0.3,0.4,0.5,0.6,0.7,0.8,0.9",
                     help="Thresholds for the validation sweep (comma separated).")
+    ap.add_argument("--target-positive-rate", type=float, default=None,
+                    help="Share of windows that contain PII in the deployment you care about (e.g. 0.20). When given, "
+                         "entity-free validation windows are re-weighted to that mix before the threshold is chosen.")
+    ap.add_argument("--dump-errors", action="store_true",
+                    help="Write <tag>_error_groups.csv and <tag>_error_samples.json: errors grouped by label and "
+                         "left context, with a few examples each.")
     ap.add_argument("--sweep-test", action="store_true",
                     help="Also report a threshold sweep on the test file (for transparency only; never used for selection).")
     ap.add_argument("--max-types", type=int, default=25, help="model.config.max_types (must be >= number of labels).")
@@ -1131,14 +1246,29 @@ def main():
             threshold = args.threshold
         elif val_parsed is not None:
             print("Selecting the confidence threshold on the VALIDATION file ...")
-            v = evaluate_model_on_dataset(parsed_examples=val_parsed, threshold=0.5, sweep=sweep_grid, **common)
+            v = evaluate_model_on_dataset(parsed_examples=val_parsed, threshold=0.5, sweep=sweep_grid,
+                                          return_store=True, **common)
+            val_store = v.pop("_store")
             best_t, best_f1 = None, -1.0
             for t_str, row in v["threshold_sweep"].items():
                 if row["micro_f1"] > best_f1:
                     best_t, best_f1 = float(t_str), row["micro_f1"]
+            weighted_info = None
+            if args.target_positive_rate:
+                best_t, wtable, w_neg = select_threshold(val_store, sweep_grid, args.target_positive_rate)
+                best_f1 = wtable[f"{best_t:g}"]["f1"]
+                weighted_info = {"target_positive_rate": args.target_positive_rate, "entity_free_weight": round(w_neg, 4),
+                                 "weighted_table": wtable}
+                print(f"  prior-shift weighting: entity-free val windows x{w_neg:.2f} "
+                      f"(target {args.target_positive_rate:.0%} windows with PII)")
             threshold = best_t
-            threshold_source = f"selected on {args.val_path} (best micro-F1 {best_f1:.4f})"
+            how = "weighted " if weighted_info else ""
+            threshold_source = f"selected on {args.val_path} (best {how}micro-F1 {best_f1:.4f})"
+            if threshold in (min(sweep_grid), max(sweep_grid)):
+                print(f"  WARNING: selected threshold {threshold:g} is at the edge of the sweep grid; "
+                      f"the optimum may lie outside it (extend --sweep).")
             val_block = {"val_path": args.val_path, "val_sha256": val_sha, "selected_threshold": threshold,
+                         "prior_shift": weighted_info,
                          "sweep": v["threshold_sweep"], "error_breakdown": v["error_breakdown"],
                          "entity_free_windows": v["entity_free_windows"],
                          "entity_free_windows_with_a_prediction": v["entity_free_windows_with_a_prediction"]}
@@ -1149,7 +1279,7 @@ def main():
 
         eval_out = evaluate_model_on_dataset(
             parsed_examples=parsed_examples, threshold=threshold,
-            sweep=(sweep_grid if args.sweep_test else None), **common)
+            sweep=(sweep_grid if args.sweep_test else None), dump_errors=args.dump_errors, **common)
 
         full_m = eval_out["metrics_full_dataset"]
         clean_m = eval_out["metrics_clean_subset_no_overlapping_gold"]
@@ -1196,8 +1326,23 @@ def main():
             **eval_out,
         }
 
+        if args.dump_errors:
+            samples = report.pop("error_samples")
+            (out_dir / f"{tag}_error_samples.json").write_text(json.dumps(samples, indent=2), encoding="utf-8")
+            with open(out_dir / f"{tag}_error_groups.csv", "w", newline="", encoding="utf-8") as fh:
+                wr = csv.DictWriter(fh, fieldnames=["side", "kind", "label", "left_context", "count", "windows"])
+                wr.writeheader()
+                wr.writerows(report["error_groups"])
+            sm = report["error_groups_summary"]
+            print(f"  error groups: {sm['distinct_groups']} distinct, top-10 groups = {sm['top10_groups_share']:.0%} of "
+                  f"{sm['total_errors']} errors -> {tag}_error_groups.csv / _error_samples.json")
         json_out.write_text(json.dumps(report, indent=2), encoding="utf-8")
         write_per_class_csv(csv_out, model_spec, step, full_m)
+        if eval_out.get("threshold_sweep"):
+            print("  test threshold sweep (for understanding only, never used for selection):")
+            print("    thr     P       R       F1")
+            for t_str, row in eval_out["threshold_sweep"].items():
+                print(f"    {t_str:<6} {row['micro_precision']:.4f}  {row['micro_recall']:.4f}  {row['micro_f1']:.4f}")
 
         print(
             f"Summary [{tag}] @thr={threshold:g}: Micro-P={full_m['micro']['precision']:.4f} "
