@@ -1,0 +1,5 @@
+outs:
+- md5: f6432a12ff5abfa20e2be4320b865792
+  size: 17057681
+  hash: md5
+  path: train_finetune.jsonl

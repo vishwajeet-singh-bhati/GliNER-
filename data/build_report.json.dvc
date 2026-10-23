@@ -1,0 +1,5 @@
+outs:
+- md5: 04287047da55684b11f0cb4e9267ba32
+  size: 5571
+  hash: md5
+  path: build_report.json

@@ -1,0 +1,5 @@
+outs:
+- md5: dea638496de85ef2e134e01010ccd02f
+  size: 3284741
+  hash: md5
+  path: train_manifest.jsonl

@@ -1,0 +1,5 @@
+outs:
+- md5: 4672ed59b86ab00c41792e22f405d41b
+  size: 4645735
+  hash: md5
+  path: test_manifest.jsonl
