@@ -1,0 +1,18 @@
+model,checkpoint_step,label,support,predicted,tp,fp,fn,precision,recall,f1,has_support
+D:\models\antshield-gliner-bf16-1epoch,,advertiser id,2163,4620,1992,2628,171,0.431169,0.920943,0.587351,True
+D:\models\antshield-gliner-bf16-1epoch,,android device id,1651,11202,1517,9685,134,0.135422,0.918837,0.236054,True
+D:\models\antshield-gliner-bf16-1epoch,,city,161,709,153,556,8,0.215797,0.950311,0.351724,True
+D:\models\antshield-gliner-bf16-1epoch,,device serial number,92,4966,1,4965,91,0.000201,0.01087,0.000395,True
+D:\models\antshield-gliner-bf16-1epoch,,email address,31,2548,31,2517,0,0.012166,1.0,0.02404,True
+D:\models\antshield-gliner-bf16-1epoch,,first name,98,244,3,241,95,0.012295,0.030612,0.017544,True
+D:\models\antshield-gliner-bf16-1epoch,,gender,5,594,2,592,3,0.003367,0.4,0.006678,True
+D:\models\antshield-gliner-bf16-1epoch,,imei number,283,6327,82,6245,201,0.01296,0.289753,0.024811,True
+D:\models\antshield-gliner-bf16-1epoch,,imsi number,36,206,36,170,0,0.174757,1.0,0.297521,True
+D:\models\antshield-gliner-bf16-1epoch,,last name,4,816,2,814,2,0.002451,0.5,0.004878,True
+D:\models\antshield-gliner-bf16-1epoch,,location coordinates,3516,8279,3120,5159,396,0.376857,0.887372,0.529038,True
+D:\models\antshield-gliner-bf16-1epoch,,other personal information,0,1017,0,1017,0,0.0,0.0,0.0,False
+D:\models\antshield-gliner-bf16-1epoch,,password,2,1989,1,1988,1,0.000503,0.5,0.001005,True
+D:\models\antshield-gliner-bf16-1epoch,,phone number,2,4399,2,4397,0,0.000455,1.0,0.000909,True
+D:\models\antshield-gliner-bf16-1epoch,,sim card iccid,5,2798,3,2795,2,0.001072,0.6,0.002141,True
+D:\models\antshield-gliner-bf16-1epoch,,username,86,23671,86,23585,0,0.003633,1.0,0.00724,True
+D:\models\antshield-gliner-bf16-1epoch,,zip code,173,4071,152,3919,21,0.037337,0.878613,0.071631,True

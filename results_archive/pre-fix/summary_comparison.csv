@@ -1,0 +1,5 @@
+model_tag,model_path,checkpoint_step,loader_type,threshold,micro_precision,micro_recall,micro_f1,macro_f1_all_17,macro_f1_supported,clean_subset_micro_f1,clean_subset_macro_f1_supported,tp,fp,fn,support
+urchade__gliner_multi_pii-v1,urchade/gliner_multi_pii-v1,,ordinary,0.5,0.022162,0.148893,0.038581,0.168936,0.179495,0.03832,0.180003,1237,54579,7071,8308
+antshield-gliner-bf16-1epoch_checkpoint-1000,D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,ordinary,0.5,0.087728,0.858329,0.159187,0.129541,0.137637,0.157888,0.137659,7131,74154,1177,8308
+antshield-gliner-bf16-1epoch_checkpoint-1800,D:\models\antshield-gliner-bf16-1epoch\checkpoint-1800,1800,ordinary,0.5,0.091555,0.864588,0.165576,0.127233,0.135185,0.164304,0.135131,7183,71273,1125,8308
+antshield-gliner-bf16-1epoch,D:\models\antshield-gliner-bf16-1epoch,,ordinary,0.5,0.091555,0.864588,0.165576,0.127233,0.135185,0.164304,0.135131,7183,71273,1125,8308

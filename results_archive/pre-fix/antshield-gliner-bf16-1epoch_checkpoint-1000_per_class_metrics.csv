@@ -1,0 +1,18 @@
+model,checkpoint_step,label,support,predicted,tp,fp,fn,precision,recall,f1,has_support
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,advertiser id,2163,5031,1956,3075,207,0.38879,0.9043,0.543786,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,android device id,1651,12017,1505,10512,146,0.125239,0.911569,0.220222,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,city,161,749,153,596,8,0.204272,0.950311,0.336264,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,device serial number,92,4013,1,4012,91,0.000249,0.01087,0.000487,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,email address,31,3512,31,3481,0,0.008827,1.0,0.017499,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,first name,98,404,3,401,95,0.007426,0.030612,0.011952,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,gender,5,665,2,663,3,0.003008,0.4,0.00597,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,imei number,283,4652,87,4565,196,0.018702,0.30742,0.035258,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,imsi number,36,140,36,104,0,0.257143,1.0,0.409091,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,last name,4,366,2,364,2,0.005464,0.5,0.010811,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,location coordinates,3516,8322,3099,5223,417,0.372386,0.881399,0.523568,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,other personal information,0,1026,0,1026,0,0.0,0.0,0.0,False
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,password,2,2181,2,2179,0,0.000917,1.0,0.001832,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,phone number,2,5618,2,5616,0,0.000356,1.0,0.000712,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,sim card iccid,5,903,3,900,2,0.003322,0.6,0.006608,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,username,86,27322,86,27236,0,0.003148,1.0,0.006276,True
+D:\models\antshield-gliner-bf16-1epoch\checkpoint-1000,1000,zip code,173,4364,163,4201,10,0.037351,0.942197,0.071854,True

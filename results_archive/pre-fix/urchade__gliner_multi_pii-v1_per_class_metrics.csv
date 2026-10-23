@@ -1,0 +1,18 @@
+model,checkpoint_step,label,support,predicted,tp,fp,fn,precision,recall,f1,has_support
+urchade/gliner_multi_pii-v1,,advertiser id,2163,1623,527,1096,1636,0.324707,0.243643,0.278394,True
+urchade/gliner_multi_pii-v1,,android device id,1651,10038,318,9720,1333,0.03168,0.192611,0.05441,True
+urchade/gliner_multi_pii-v1,,city,161,128,95,33,66,0.742188,0.590062,0.657439,True
+urchade/gliner_multi_pii-v1,,device serial number,92,54,1,53,91,0.018519,0.01087,0.013699,True
+urchade/gliner_multi_pii-v1,,email address,31,515,12,503,19,0.023301,0.387097,0.043956,True
+urchade/gliner_multi_pii-v1,,first name,98,106,2,104,96,0.018868,0.020408,0.019608,True
+urchade/gliner_multi_pii-v1,,gender,5,72,2,70,3,0.027778,0.4,0.051948,True
+urchade/gliner_multi_pii-v1,,imei number,283,317,40,277,243,0.126183,0.141343,0.133333,True
+urchade/gliner_multi_pii-v1,,imsi number,36,75,33,42,3,0.44,0.916667,0.594595,True
+urchade/gliner_multi_pii-v1,,last name,4,25,2,23,2,0.08,0.5,0.137931,True
+urchade/gliner_multi_pii-v1,,location coordinates,3516,114,46,68,3470,0.403509,0.013083,0.025344,True
+urchade/gliner_multi_pii-v1,,other personal information,0,14,0,14,0,0.0,0.0,0.0,False
+urchade/gliner_multi_pii-v1,,password,2,728,2,726,0,0.002747,1.0,0.005479,True
+urchade/gliner_multi_pii-v1,,phone number,2,7,2,5,0,0.285714,1.0,0.444444,True
+urchade/gliner_multi_pii-v1,,sim card iccid,5,36,1,35,4,0.027778,0.2,0.04878,True
+urchade/gliner_multi_pii-v1,,username,86,41741,83,41658,3,0.001988,0.965116,0.003969,True
+urchade/gliner_multi_pii-v1,,zip code,173,223,71,152,102,0.318386,0.410405,0.358586,True
