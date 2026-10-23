@@ -237,6 +237,29 @@ class TestEvaluateGlinerAudit(unittest.TestCase):
         self.assertEqual(state["oom_chunks"], 1)
         self.assertEqual(state["batch_oom"], 1)
 
+    def test_error_report_groups_repeated_templates(self):
+        toks = ["sessionid", "=", "3f1a2b4c-1111-4222-8333-444455556666", "x"]
+        store = [([], [(2, 2, "advertiser id", 0.95)], False, toks) for _ in range(5)]
+        store.append(([(2, 2, "advertiser id")], [(2, 2, "advertiser id", 0.9)], False, toks))
+        rows, samples, summ = audit.build_error_report(store, 0.5)
+        self.assertEqual(len(rows), 1)                       # 5 identical FPs collapse into one group
+        self.assertEqual(rows[0]["count"], 5)
+        self.assertEqual(rows[0]["kind"], "in_entity_free_window")
+        self.assertIn("sessionid", rows[0]["left_context"])
+        self.assertEqual(summ["top10_groups_share"], 1.0)
+
+    def test_prior_shift_threshold_selection(self):
+        # positives always score 0.9; negatives contain a 0.6-scored false positive in 1 of 2 windows
+        pos = [([(0, 0, "city")], [(0, 0, "city", 0.9)], False) for _ in range(10)]
+        neg = [([], [(1, 1, "city", 0.6)], False), ([], [], False)]
+        store = pos + neg
+        t_plain, _, w1 = audit.select_threshold(store, [0.3, 0.7], None)
+        self.assertEqual(w1, 1.0)
+        t_shift, table, w = audit.select_threshold(store, [0.3, 0.7], 0.1)   # deployment has far fewer positives
+        self.assertGreater(w, 1.0)
+        self.assertEqual(t_shift, 0.7)                                       # precision matters more -> higher threshold
+        self.assertGreaterEqual(t_shift, t_plain)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
