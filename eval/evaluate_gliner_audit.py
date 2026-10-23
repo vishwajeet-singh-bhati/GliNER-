@@ -291,16 +291,24 @@ class SubwordChunker:
 
 
 class WordChunker:
-    """Chunks by WORD count (GLiNER's max_len unit).  A window with <= max_len words is ONE chunk;
-    longer ones are split into max_len-word chunks with `overlap_words` of overlap.  Same interface as
-    SubwordChunker (chunk_tokens -> (chunks, per-word subword counts))."""
+    """Chunks by WORD count (GLiNER's max_len unit) AND caps each chunk's length in subwords.
 
-    def __init__(self, subword_counter_fn, labels, max_len: int = 384, overlap_words: int = 30):
+    * <= max_len words and <= max_subwords (incl. the label prompt) -> ONE chunk (the normal case).
+    * The subword cap matters: a 300-word window made of long hex/base64 tokens can be 5,000+ subwords,
+      and DeBERTa's attention is quadratic in that (one such window asked for 31 GiB and crashed the
+      evaluation).  Training dropped windows over 1,024 subwords, so the model never saw longer inputs;
+      the default cap mirrors that.
+    Same interface as SubwordChunker (chunk_tokens -> (chunks, per-word subword counts))."""
+
+    def __init__(self, subword_counter_fn, labels, max_len: int = 384, overlap_words: int = 30,
+                 max_subwords: int = 1024):
         self.subword_counter_fn = subword_counter_fn
         self.max_len = max_len
         self.overlap_words = min(overlap_words, max(0, max_len // 4))
         self.prompt_overhead = sum(1 + max(1, subword_counter_fn(l)) for l in labels) + 3
-        self.text_budget = max_len        # unit: words
+        self.sub_budget = max(16, max_subwords - self.prompt_overhead)
+        self.overlap_subwords = self.sub_budget // 4
+        self.text_budget = max_len        # unit: words (the subword cap is sub_budget)
 
     def chunk_tokens(self, tokens):
         n = len(tokens)
@@ -309,12 +317,26 @@ class WordChunker:
         wsub = [max(1, self.subword_counter_fn(w)) for w in tokens]
         chunks, start = [], 0
         while start < n:
-            end = min(start + self.max_len, n)
-            chunks.append(ChunkSpec(start_tok=start, end_tok=end - 1,
-                                    subword_count=self.prompt_overhead + sum(wsub[start:end])))
-            if end == n:
+            if wsub[start] > self.sub_budget:        # a single giant token: isolate it, flag it
+                chunks.append(ChunkSpec(start_tok=start, end_tok=start,
+                                        subword_count=self.prompt_overhead + wsub[start],
+                                        exceeded_single_token_budget=True))
+                start += 1
+                continue
+            end, cur = start, 0
+            while end < n and end - start < self.max_len and cur + wsub[end] <= self.sub_budget:
+                cur += wsub[end]
+                end += 1
+            chunks.append(ChunkSpec(start_tok=start, end_tok=end - 1, subword_count=self.prompt_overhead + cur))
+            if end >= n:
                 break
-            start = end - self.overlap_words
+            nxt, back_w, back_s = end, 0, 0
+            while (nxt > start + 1 and back_w < self.overlap_words
+                   and back_s + wsub[nxt - 1] <= self.overlap_subwords):
+                nxt -= 1
+                back_w += 1
+                back_s += wsub[nxt]
+            start = nxt
         return chunks, wsub
 
 
@@ -692,8 +714,21 @@ def score_store(store, labels: List[str], threshold: float):
     return full, clean, errors, ef_labels, n_ef, n_pred_windows_entity_free
 
 
+def _is_oom(exc) -> bool:
+    return "out of memory" in str(exc).lower() or exc.__class__.__name__ == "OutOfMemoryError"
+
+
+def _free_gpu():
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _predict_many(model, texts, labels, flat_ner, threshold, multi_label, batch_size, state):
-    """Batched inference with a safe fallback to one-by-one predict_entities."""
+    """Batched inference.  On CUDA OOM the batch is retried one chunk at a time; a chunk that still
+    does not fit is counted in state['oom_chunks'] (reported in the audit) instead of crashing the run."""
     if batch_size > 1 and len(texts) > 1 and not state.get("batch_broken"):
         try:
             out = model.inference(texts, labels, flat_ner=flat_ner, threshold=threshold,
@@ -701,10 +736,29 @@ def _predict_many(model, texts, labels, flat_ner, threshold, multi_label, batch_
             if len(out) == len(texts):
                 return out
         except Exception as exc:
-            state["batch_broken"] = True
-            print(f"  [note] batched inference unavailable ({exc!r}); falling back to one window at a time", flush=True)
-    return [model.predict_entities(t, labels, flat_ner=flat_ner, threshold=threshold, multi_label=multi_label)
-            for t in texts]
+            if _is_oom(exc):
+                state["batch_oom"] = state.get("batch_oom", 0) + 1
+                if state["batch_oom"] <= 3:
+                    print("  [note] batch ran out of GPU memory; retrying this batch one chunk at a time", flush=True)
+            else:
+                state["batch_broken"] = True
+                print(f"  [note] batched inference unavailable ({exc!r}); falling back to one window at a time", flush=True)
+            _free_gpu()
+    results = []
+    for t in texts:
+        try:
+            results.append(model.predict_entities(t, labels, flat_ner=flat_ner, threshold=threshold,
+                                                  multi_label=multi_label))
+        except Exception as exc:
+            if not _is_oom(exc):
+                raise
+            state["oom_chunks"] = state.get("oom_chunks", 0) + 1
+            if state["oom_chunks"] <= 3:
+                print("  [warning] a chunk does not fit in GPU memory even alone; counted as no prediction "
+                      "(see chunking_audit.chunks_failed_oom)", flush=True)
+            _free_gpu()
+            results.append([])
+    return results
 
 
 def evaluate_model_on_dataset(
@@ -720,6 +774,7 @@ def evaluate_model_on_dataset(
     chunk_unit: str = "words",
     sweep: Optional[Sequence[float]] = None,
     batch_size: int = 1,
+    max_subwords: int = 1024,
 ) -> Dict[str, Any]:
     """Runs the model ONCE over the windows and scores the cached predictions.
 
@@ -732,7 +787,7 @@ def evaluate_model_on_dataset(
     model_max_len = max_len_override or int(getattr(getattr(model, "config", None), "max_len", 384))
     subword_counter = build_subword_counter(model)
     if chunk_unit == "words":
-        chunker = WordChunker(subword_counter, labels=labels, max_len=model_max_len)
+        chunker = WordChunker(subword_counter, labels=labels, max_len=model_max_len, max_subwords=max_subwords)
     else:
         chunker = SubwordChunker(subword_counter, labels=labels, max_len=model_max_len)
 
@@ -821,6 +876,11 @@ def evaluate_model_on_dataset(
         flush()
 
     elapsed_total = time.time() - t0
+    chunk_stats["chunks_failed_oom"] = state.get("oom_chunks", 0)
+    chunk_stats["batches_retried_after_oom"] = state.get("batch_oom", 0)
+    if chunk_stats["chunks_failed_oom"]:
+        print(f"WARNING: {chunk_stats['chunks_failed_oom']} chunk(s) could not be run (GPU OOM); "
+              f"they count as misses.  Lower --max-subwords.", flush=True)
     full, clean, errors, ef_labels, n_ef, n_ef_with_pred = score_store(store, labels, threshold)
     out = {
         "elapsed_seconds": round(elapsed_total, 2),
@@ -950,7 +1010,10 @@ def main():
     ap.add_argument("--max-len", type=int, default=None, help="Override model max_len (default: model.config.max_len, in WORDS).")
     ap.add_argument("--chunk-unit", choices=["words", "subwords"], default="words",
                     help="'words' (default, GLiNER's own unit) or the legacy 'subwords' budget.")
-    ap.add_argument("--batch-size", type=int, default=8, help="windows per forward pass (1 = one at a time).")
+    ap.add_argument("--batch-size", type=int, default=4, help="windows per forward pass (1 = one at a time).")
+    ap.add_argument("--max-subwords", type=int, default=1024,
+                    help="max subwords per forward pass incl. the label prompt (training dropped windows above 1024). "
+                         "Lower it (e.g. 768) if you still run out of GPU memory.")
     ap.add_argument("--no-flat-ner", dest="flat_ner", action="store_false", help="Disable flat_ner in predict_entities.")
     ap.add_argument("--multi-label", action="store_true", help="Enable multi_label in predict_entities.")
     ap.add_argument("--allow-enclosing-boundary", action="store_true", help="Snap sub-token char spans to enclosing token.")
@@ -1059,6 +1122,7 @@ def main():
             model=model, labels=labels, flat_ner=args.flat_ner, multi_label=args.multi_label,
             allow_enclosing_fallback=args.allow_enclosing_boundary, max_len_override=args.max_len,
             progress_every=args.progress_every, chunk_unit=args.chunk_unit, batch_size=args.batch_size,
+            max_subwords=args.max_subwords,
         )
 
         threshold_source = "fixed (--threshold)"
@@ -1105,6 +1169,7 @@ def main():
                 "max_types": max_types,
                 "chunk_unit": args.chunk_unit,
                 "batch_size": args.batch_size,
+                "max_subwords": args.max_subwords,
                 "device": device,
                 "limit": args.limit,
                 "labels_source": labels_source,

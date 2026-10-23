@@ -369,9 +369,38 @@ class CleanTrainingLoggerCallback(TrainerCallback):
             self.last_train_acc = 0.7 * self.last_train_acc + 0.3 * stats["acc"]
             self.last_train_f1 = 0.7 * self.last_train_f1 + 0.3 * stats["f1"]
 
+    def _restore_best_state(self):
+        """On resume, reload the previous best score + leaderboard so a worse checkpoint cannot
+        overwrite best_checkpoint (before this, a resumed run started from best_score=-1)."""
+        info_p = self.best_dir / "best_checkpoint_info.json"
+        try:
+            if info_p.exists():
+                info = json.loads(info_p.read_text(encoding="utf-8"))
+                self.best_score = float(info.get("val_f1", 0.0)) + 0.001 * float(info.get("val_acc", 0.0))
+                self.best_checkpoint_name = str(info.get("best_checkpoint", "None"))
+                if info.get("val_loss") is not None:
+                    self.best_val_loss = float(info["val_loss"])
+                print(f"Resume: keeping previous best {self.best_checkpoint_name} "
+                      f"(val F1 {info.get('val_f1')}) in best_checkpoint/", flush=True)
+            if self.history_csv.exists():
+                with open(self.history_csv, newline="", encoding="utf-8") as fh:
+                    for row in csv.DictReader(fh):
+                        for k in ("step", "epoch"):
+                            row[k] = int(float(row[k]))
+                        for k in ("train_loss", "train_acc", "train_f1", "val_acc", "val_precision",
+                                  "val_recall", "val_f1"):
+                            row[k] = float(row[k])
+                        row["is_best"] = str(row.get("is_best")) == "True"
+                        self.leaderboard.append(row)
+                        self.evaluated_steps.add(row["step"])
+        except Exception as exc:
+            print(f"  [Warning] could not restore previous best state: {exc}", flush=True)
+
     def on_train_begin(self, args, state, control, **kwargs):
         self.segment_start_time = time.time()
         self.start_step = state.global_step
+        if self.start_step > 0:
+            self._restore_best_state()
         cur_epoch = (self.start_step // self.steps_per_epoch) + 1
         step_in_epoch = (self.start_step % self.steps_per_epoch)
 
@@ -596,7 +625,7 @@ class CleanTrainingLoggerCallback(TrainerCallback):
             "train_acc", "train_f1", "val_acc", "val_precision", "val_recall", "val_f1", "val_threshold", "is_best"
         ]
         with open(self.history_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
+            writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore", restval="")
             writer.writeheader()
             writer.writerows(self.leaderboard)
 

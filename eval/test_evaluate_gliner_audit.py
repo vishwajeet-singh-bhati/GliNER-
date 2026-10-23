@@ -202,6 +202,41 @@ class TestEvaluateGlinerAudit(unittest.TestCase):
             self.assertEqual(labels, ["city", "gender"])
             self.assertIn("train_labels.json", src)
 
+    def test_word_chunker_caps_subwords_for_huge_windows(self):
+        counter_fn = lambda w: 12                      # 300 words * 12 = 3600 subwords
+        ch = audit.WordChunker(counter_fn, labels=self.labels, max_len=384, max_subwords=1024)
+        toks = [f"w{i}" for i in range(300)]
+        chunks, wsub = ch.chunk_tokens(toks)
+        self.assertGreater(len(chunks), 3)
+        covered = set()
+        for c in chunks:
+            self.assertLessEqual(sum(wsub[c.start_tok:c.end_tok + 1]), ch.sub_budget)
+            covered.update(range(c.start_tok, c.end_tok + 1))
+        self.assertEqual(covered, set(range(300)))
+
+    def test_word_chunker_isolates_giant_token(self):
+        counter_fn = lambda w: 5000 if w == "BIG" else 1
+        ch = audit.WordChunker(counter_fn, labels=self.labels, max_len=384, max_subwords=1024)
+        chunks, _ = ch.chunk_tokens(["a", "b", "BIG", "c"])
+        self.assertEqual(sum(c.exceeded_single_token_budget for c in chunks), 1)
+        self.assertEqual({i for c in chunks for i in range(c.start_tok, c.end_tok + 1)}, {0, 1, 2, 3})
+
+    def test_oom_does_not_crash_and_is_counted(self):
+        class M:
+            calls = 0
+            def inference(self, texts, labels, **kw):
+                raise RuntimeError("CUDA out of memory. Tried to allocate 31 GiB")
+            def predict_entities(self, t, labels, **kw):
+                M.calls += 1
+                if "huge" in t:
+                    raise RuntimeError("CUDA out of memory")
+                return [{"start": 0, "end": 1, "label": "city", "score": 0.9}]
+        state = {}
+        out = audit._predict_many(M(), ["ok a", "huge b", "ok c"], ["city"], True, 0.5, False, 4, state)
+        self.assertEqual([len(x) for x in out], [1, 0, 1])
+        self.assertEqual(state["oom_chunks"], 1)
+        self.assertEqual(state["batch_oom"], 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
