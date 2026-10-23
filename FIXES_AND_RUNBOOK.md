@@ -44,3 +44,16 @@ Not run: end-to-end training, batched `model.inference` in the evaluator (falls 
 Known limits: val is app-disjoint from train but test shares ~72% of apps with train, so val is a bit harder
 than test; 7 classes (email, gender, imsi, last name, password, phone, iccid) have <=36 real test spans and are
 trained on synthetic values, so their per-class F1 is noisy.
+
+## Round 2 (after the first FP-model evaluation)
+
+Findings on `checkpoint-6792` (test micro-F1 0.862, P 0.775, R 0.970; threshold barely matters, FPs score >= 0.98):
+* 1,234 of 2,331 false positives (53%) are ONE constant UUID in one app's header (Roblox-Session-Id), present in
+  1,239 test windows (5.5%) and in 0 train/val windows. The test set is dominated by near-duplicate templates.
+* 421 FPs (18%) are windows that START in the middle of a coordinate; the old fixed-stride windows cut entities,
+  dropped the fragment's gold and kept its text.
+* `--test-cap-per-template` writes `test_capped_finetune.jsonl` (<= 5 windows per canonical template) as a second,
+  less duplicate-dominated test view; report BOTH numbers.
+* Windowing is now boundary-safe (window edges never cut an entity). Test spans rise 8,292 -> 9,269 because entities
+  that used to be lost to edge cuts / the 3-window cap are now whole in some window: numbers on the new test file are
+  NOT directly comparable with earlier ones (old data is tagged `data-v2-post-fix` in DVC).
