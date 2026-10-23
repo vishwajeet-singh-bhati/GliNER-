@@ -32,9 +32,30 @@ from splitting import assign_split, assign_split_campaign  # noqa: E402
 _RECON_PATTERN = build_recon_pattern()
 
 
+def _fuses_left(prev_text: str, value: str) -> bool:
+    """True if `value` would merge with the text before it into ONE GLiNER token
+    (e.g. 'text/plain' + '289a998b-...' -> 'plain289a998b-...')."""
+    ctx = prev_text[-2:]
+    return not any(t[1] == len(ctx) for t in tokenize_with_offsets(ctx + value))
+
+
+def _fuses_right(value: str, next_text: str) -> bool:
+    """True if `value` would merge with the text after it into ONE GLiNER token."""
+    ctx = "R" if next_text.startswith("RECON_") else next_text[:2]
+    return not any(t[2] == len(value) for t in tokenize_with_offsets(value + ctx))
+
+
 def build_char_entities(text: str, mask_recon_tokens: bool, seed_prefix: str):
     """Same span-finding/masking logic as convert_to_gliner_format.py,
-    returning (final_text, [(char_start, char_end, gliner_label), ...])."""
+    returning (final_text, [(char_start, char_end, gliner_label), ...]).
+
+    Masking is BOUNDARY-SAFE (fix for BUG-002): the redaction tokens are often glued
+    to neighbouring text ("...text/plain<TOKEN>", "goid=1489461607753<TOKEN>",
+    "%7E%7E<TOKEN>%7E%7E", or two tokens back to back).  After substitution the
+    synthetic value would fuse with its neighbours into a single GLiNER token and the
+    span could not be expressed in token indices (7.5% of spans before this fix).  A
+    single space is therefore inserted on the side(s) where fusion would happen, so
+    every entity starts and ends exactly on a token boundary."""
     matches = list(_RECON_PATTERN.finditer(text))
 
     if not mask_recon_tokens:
@@ -46,14 +67,31 @@ def build_char_entities(text: str, mask_recon_tokens: bool, seed_prefix: str):
     out_parts = []
     entities = []
     cursor = 0
+    out_len = 0
+    last_tail = ""  # last two characters written so far
     for i, m in enumerate(matches):
-        out_parts.append(text[cursor:m.start()])
+        gap = text[cursor:m.start()]
+        out_parts.append(gap)
+        out_len += len(gap)
+        last_tail = (last_tail + gap)[-2:]
+
         label = extract_recon_label(m.group(0))
-        replacement = synthesize(label, seed_key=f"{seed_prefix}:{i}")
-        new_start = sum(len(p) for p in out_parts)
+        replacement = synthesize(
+            label, seed_key=f"{seed_prefix}:{i}", context=text[max(0, m.start() - 24):m.start()]
+        )
+        if last_tail and _fuses_left(last_tail, replacement):
+            out_parts.append(" ")
+            out_len += 1
+        new_start = out_len
         out_parts.append(replacement)
-        new_end = new_start + len(replacement)
-        entities.append((new_start, new_end, label))
+        out_len += len(replacement)
+        entities.append((new_start, out_len, label))
+        last_tail = (last_tail + replacement)[-2:]
+        rest = text[m.end():m.end() + 6]
+        if rest and _fuses_right(replacement, rest):
+            out_parts.append(" ")
+            out_len += 1
+            last_tail = (last_tail + " ")[-2:]
         cursor = m.end()
     out_parts.append(text[cursor:])
     return "".join(out_parts), entities

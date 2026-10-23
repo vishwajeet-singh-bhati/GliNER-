@@ -60,7 +60,7 @@ def _load_productive_headers(path=_DEFAULT_PRODUCTIVE_HEADERS_PATH) -> Optional[
             f"Run: python data/analyze_pii_bearing_fields.py --dataset-root <path> to generate it."
         )
         return None
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return set(json.load(f))
 
 
@@ -134,7 +134,7 @@ def load_antshield_dataset(dataset_root: str, include_metadata: bool = False) ->
     include_metadata: see _extract_text's docstring.
     """
     pattern = os.path.join(dataset_root, "raw_data", "**", "*.json")
-    files = glob.glob(pattern, recursive=True)
+    files = sorted(glob.glob(pattern, recursive=True))   # sorted: filesystem-independent order
     if not files:
         raise FileNotFoundError(
             f"No JSON files found under {pattern}. "
@@ -152,10 +152,15 @@ def load_antshield_dataset(dataset_root: str, include_metadata: bool = False) ->
             print(f"[warn] skipping unparseable file {fp}: {e}")
             continue
 
+        # REPRO-001 fix: the record id (which seeds the synthetic masking values and the
+        # train/test routing) used to embed the ABSOLUTE path, so the same dataset in a
+        # different folder produced different data.  Use the path relative to the dataset
+        # root with '/' separators instead ("raw_data/auto_anteater/batch1/HTTP/x.json").
+        rel = os.path.relpath(fp, dataset_root).replace(os.sep, "/")
         for key, packet in packets.items():
             records.append(
                 PacketRecord(
-                    record_id=f"{fp}::{key}",
+                    record_id=f"{rel}::{key}",
                     text=_extract_text(packet, productive_headers, include_metadata),
                     label=int(packet.get("label", 0)),
                     pii_types=list(packet.get("pii_types") or []),

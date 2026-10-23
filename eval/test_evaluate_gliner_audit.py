@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Unit tests for eval/evaluate_gliner_audit.py
 Covers:
@@ -140,6 +140,67 @@ class TestEvaluateGlinerAudit(unittest.TestCase):
         self.assertEqual(len(giant_chunks), 1)
         self.assertEqual(giant_chunks[0].start_tok, 25)
         self.assertEqual(giant_chunks[0].end_tok, 25)
+
+    # ---- tests for the fixes -------------------------------------------------------------
+    def test_word_chunker_single_pass_for_300_word_window(self):
+        counter_fn = lambda w: 3          # pessimistic: 3 subwords per word -> 900 subwords
+        ch = audit.WordChunker(counter_fn, labels=self.labels, max_len=384)
+        chunks, _ = ch.chunk_tokens([f"w{i}" for i in range(300)])
+        self.assertEqual(len(chunks), 1)  # the legacy subword chunker would split this
+        legacy = audit.SubwordChunker(counter_fn, labels=self.labels, max_len=384)
+        self.assertGreater(len(legacy.chunk_tokens([f"w{i}" for i in range(300)])[0]), 1)
+
+    def test_word_chunker_covers_long_windows(self):
+        ch = audit.WordChunker(lambda w: 1, labels=self.labels, max_len=100, overlap_words=10)
+        toks = [f"w{i}" for i in range(450)]
+        chunks, _ = ch.chunk_tokens(toks)
+        covered = set()
+        for c in chunks:
+            self.assertLessEqual(c.end_tok - c.start_tok + 1, 100)
+            covered.update(range(c.start_tok, c.end_tok + 1))
+        self.assertEqual(covered, set(range(450)))
+
+    def test_error_taxonomy(self):
+        gold = {(0, 1, "first name"), (5, 5, "city"), (9, 9, "zip code"), (12, 12, "gender")}
+        pred = {(0, 1, "last name"),      # same span, wrong label  -> fp+fn label confusion
+                (4, 5, "city"),           # boundary, same label    -> fp boundary + fn boundary
+                (20, 20, "password")}     # spurious in positive window; zip/gender missed
+        errs, _ = audit.classify_errors(gold, pred)
+        self.assertEqual(errs["fp_label_confusion"], 1)
+        self.assertEqual(errs["fn_label_confusion"], 1)
+        self.assertEqual(errs["fp_boundary_same_label"], 1)
+        self.assertEqual(errs["fn_boundary"], 1)
+        self.assertEqual(errs["fp_spurious_in_positive_window"], 1)
+        self.assertEqual(errs["fn_missed"], 2)
+        errs2, by_label = audit.classify_errors(set(), {(3, 3, "advertiser id")})
+        self.assertEqual(errs2["fp_in_entity_free_window"], 1)
+        self.assertEqual(by_label["advertiser id"], 1)
+
+    def test_score_store_threshold_filtering(self):
+        labels = ["city", "gender"]
+        store = [
+            ([(0, 0, "city")], [(0, 0, "city", 0.9), (4, 4, "gender", 0.4)], False),
+            ([], [(2, 2, "city", 0.6)], False),
+        ]
+        full, _c, errs, ef, n_ef, n_ef_pred = audit.score_store(store, labels, 0.5)
+        m = audit.compute_metrics_table(full, labels)["micro"]
+        self.assertEqual((m["tp"], m["fp"], m["fn"]), (1, 1, 0))   # 0.4 dropped, 0.6 kept
+        self.assertEqual((n_ef, n_ef_pred), (1, 1))
+        full, *_ = audit.score_store(store, labels, 0.7)
+        m = audit.compute_metrics_table(full, labels)["micro"]
+        self.assertEqual((m["tp"], m["fp"], m["fn"]), (1, 0, 0))
+        full, *_ = audit.score_store(store, labels, 0.3)
+        m = audit.compute_metrics_table(full, labels)["micro"]
+        self.assertEqual((m["tp"], m["fp"], m["fn"]), (1, 2, 0))
+
+    def test_resolve_labels_prefers_train_labels(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "train_labels.json").write_text(json.dumps(["city", "gender"]), encoding="utf-8")
+            (Path(d) / "checkpoint-5").mkdir()
+            labels, src = audit.resolve_labels(str(Path(d) / "checkpoint-5"), None)
+            self.assertEqual(labels, ["city", "gender"])
+            self.assertIn("train_labels.json", src)
 
 
 if __name__ == "__main__":

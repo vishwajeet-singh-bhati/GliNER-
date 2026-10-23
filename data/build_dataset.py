@@ -5,7 +5,8 @@ reusing the existing preprocessing unchanged (antshield_loader header whitelist,
 RECON_ masking via recon_synthesizer, GLiNER tokenization, 300-token windows /
 30 overlap / max 3 windows per record) and adding:
 
-  * NO validation split.
+  * a real VALIDATION split (whole apps carved out of the campaign-routed train flows, natural class
+    prior, exact-duplicate windows removed) used for early stopping / threshold selection.
   * per-class routing (see synth_config.py): classes in SYNTHETIC_ONLY have all
     their real flows in TEST; classes in SPLIT_20_80 get ~20% of real flows in
     TRAIN (grouped by app) and ~80% in TEST; all other classes keep the original
@@ -13,18 +14,22 @@ RECON_ masking via recon_synthesizer, GLiNER tokenization, 300-token windows /
   * synthetic top-up in TRAIN for the first two groups (synth_inject/synth_values),
     placed in real negative contexts, plus non-PII decoys built the same way.
   * entity-free train windows capped at --neg-ratio x positive windows (seeded).
-  * train windows identical to a test window are dropped (leakage guard).
+  * leakage guard on a CANONICAL fingerprint (entity values -> <LABEL>, digits -> 0, long ids -> X):
+    train windows with a canonical twin in val/test, and val windows with a twin in test, are dropped.
+  * exact-duplicate windows are removed from val/test (3k identical NUL-blob windows inflated the
+    old test negatives) and entity-free train windows are de-duplicated before sampling.
   * line-aligned manifests: every output line is traceable (real flow / synthetic / decoy).
 
 Usage (from repo root):
   python data/build_dataset.py --stats-only      # class x campaign table + routing, writes nothing
-  python data/build_dataset.py                   # writes data/{train,test}_finetune.jsonl (+ manifests, report)
+  python data/build_dataset.py                   # writes data/{train,val,test}_finetune.jsonl (+ manifests, report)
 """
 import argparse
 import hashlib
 import json
 import math
 import random
+import re
 import sys
 from collections import Counter, defaultdict, namedtuple
 from pathlib import Path
@@ -63,7 +68,7 @@ def load_flows(args):
     return flows
 
 
-def route_flows(flows, seed):
+def route_flows(flows, seed, val_frac=0.10):
     route, pool = {}, []
     for f in flows:
         pols = {policy_of(l) for _, _, l in f.entities}
@@ -71,8 +76,21 @@ def route_flows(flows, seed):
             route[f.record_id] = "test"
         elif "split_20_80" in pols:
             pool.append(f)
-        else:  # original campaign rule; the old val carve-out goes back to train
+        else:  # original campaign rule; the old per-record val carve-out goes back to train
             route[f.record_id] = "test" if assign_split_campaign(f.record_id) == "test" else "train"
+    # VAL: carve whole apps (packages) out of the campaign-routed train flows, so val shares no app
+    # (hence no per-app traffic signature) with train.  Synthetic-policy classes keep all their train flows.
+    camp = defaultdict(list)
+    for f in flows:
+        if route.get(f.record_id) == "train" and not any(policy_of(l) != "campaign" for _, _, l in f.entities):
+            camp[f.package].append(f)
+    n_camp = sum(len(v) for v in camp.values())
+    vtarget, n_val = int(val_frac * n_camp), 0
+    for p in sorted(camp, key=lambda p: split_bucket(f"{seed}:val:{p}")):
+        if n_val + len(camp[p]) <= vtarget:
+            for f in camp[p]:
+                route[f.record_id] = "val"
+            n_val += len(camp[p])
     groups = defaultdict(list)
     for f in pool:
         groups[f.package].append(f)
@@ -103,7 +121,8 @@ def print_flow_table(flows, route):
         print(f"{lab:<28}{policy_of(lab):<16}{c['flows']:>7}{c['auto']:>7}{c['manual']:>8}{c['->train']:>9}{c['->test']:>8}")
     n_neg = sum(1 for f in flows if not f.entities)
     print(f"\nflows total {len(flows)}; without entities {n_neg}; "
-          f"routed train {sum(v == 'train' for v in route.values())} / test {sum(v == 'test' for v in route.values())}")
+          f"routed train {sum(v == 'train' for v in route.values())} / val {sum(v == 'val' for v in route.values())}"
+          f" / test {sum(v == 'test' for v in route.values())}")
 
 
 def make_windows(flows, split, route, args):
@@ -185,6 +204,48 @@ def fingerprint(w):
     return hashlib.md5(json.dumps([w["tokenized_text"], w["ner"]], separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+_HEXY = re.compile(r"[0-9A-Za-z_-]{12,}")
+
+
+def canonical_fingerprint(w):
+    """Twin detector: windows that differ only in entity values / digits / long ids are the same
+    template (the masker re-draws values per record, so exact hashes never match)."""
+    lab_at = {}
+    for s_, e_, l_ in w["ner"]:
+        for i in range(s_, e_ + 1):
+            lab_at[i] = l_
+    out, prev = [], None
+    for i, t in enumerate(w["tokenized_text"]):
+        if i in lab_at:
+            if prev != lab_at[i]:
+                out.append("<" + lab_at[i] + ">")
+            prev = lab_at[i]
+            continue
+        prev = None
+        if _HEXY.fullmatch(t) and re.search(r"\d", t):
+            out.append("X")
+        else:
+            out.append(re.sub(r"\d", "0", t))
+    return hashlib.md5("\x1f".join(out).encode("utf-8")).hexdigest()
+
+
+def dedupe_exact(items, entity_free_only=True):
+    """Drop exact-duplicate windows (keeps the first).  By default only entity-free ones are
+    collapsed; windows with entities are real evidence and are kept as they are."""
+    seen, kept, dropped = set(), [], 0
+    for w, m in items:
+        if entity_free_only and w["ner"]:
+            kept.append((w, m))
+            continue
+        fp = fingerprint(w)
+        if fp in seen:
+            dropped += 1
+            continue
+        seen.add(fp)
+        kept.append((w, m))
+    return kept, dropped
+
+
 def labels_of(w):
     return sorted({n[2] for n in w["ner"]})
 
@@ -228,7 +289,9 @@ def main():
     ap.add_argument("--include-metadata-fields", action="store_true")
     ap.add_argument("--target-windows", type=int, default=cfg.TARGET_TRAIN_WINDOWS,
                     help="train windows per synthetic-policy class (real + synthetic)")
-    ap.add_argument("--neg-ratio", type=float, default=1.0, help="train entity-free windows : positive windows")
+    ap.add_argument("--neg-ratio", type=float, default=3.0,
+                    help="train entity-free windows : positive windows (3.0 ~ the real 14.5%% test prior; the old 1.0 gave a 51%% positive train prior)")
+    ap.add_argument("--val-frac", type=float, default=0.10, help="fraction of campaign-routed train flows moved to val (whole apps)")
     ap.add_argument("--decoy-ratio", type=float, default=0.5, help="decoy windows per synthetic positive window")
     ap.add_argument("--cooccur-prob", type=float, default=0.2)
     ap.add_argument("--carrier-pool", type=int, default=3000)
@@ -239,8 +302,9 @@ def main():
     valid = set(all_gliner_labels())
     assert SYNTH_CLASSES <= valid, f"unknown labels in synth_config: {SYNTH_CLASSES - valid}"
     out_dir = Path(args.output_dir)
-    outputs = [out_dir / n for n in ("train_finetune.jsonl", "test_finetune.jsonl", "train_manifest.jsonl",
-                                     "test_manifest.jsonl", "build_report.json")]
+    outputs = [out_dir / n for n in ("train_finetune.jsonl", "val_finetune.jsonl", "test_finetune.jsonl",
+                                     "train_manifest.jsonl", "val_manifest.jsonl", "test_manifest.jsonl",
+                                     "build_report.json")]
     if not args.stats_only and not args.force and any(p.exists() for p in outputs):
         sys.exit("Output files already exist: " + ", ".join(str(p) for p in outputs if p.exists())
                  + "\nMove them away or pass --force.")
@@ -248,7 +312,7 @@ def main():
     rng = random.Random(f"{args.seed}:build")
     print("Loading + masking flows (same steps as prepare_finetune_data) ...")
     flows = load_flows(args)
-    route = route_flows(flows, args.seed)
+    route = route_flows(flows, args.seed, args.val_frac)
     print_flow_table(flows, route)
     if args.stats_only:
         return
@@ -256,14 +320,24 @@ def main():
     # ---- real windows ----------------------------------------------------------
     train_real, d1 = make_windows(flows, "train", route, args)
     test_items, d2 = make_windows(flows, "test", route, args)
+    val_items, d3 = make_windows(flows, "val", route, args)
+    test_items, test_dups = dedupe_exact(test_items)
+    val_items, val_dups = dedupe_exact(val_items)
     # adjacent markers (e.g. RECON_SerialNumberRECON_AndroidId) merge into ONE token after masking, so two
     # entities share a token: corrupt supervision. Dropped from train only; test is left exactly as built.
     n_overlap = sum(has_overlap(w) for w, _ in train_real)
     train_real = [x for x in train_real if not has_overlap(x[0])]
     real_pos = [x for x in train_real if x[0]["ner"]]
-    real_neg = [x for x in train_real if not x[0]["ner"]]
+    real_neg_all = [x for x in train_real if not x[0]["ner"]]
+    seen_c, real_neg = Counter(), []
+    for x in real_neg_all:                      # cap template twins (<=8 per template) so negatives stay diverse
+        c = canonical_fingerprint(x[0])
+        if seen_c[c] < 8:
+            seen_c[c] += 1
+            real_neg.append(x)
     print(f"\nreal train windows {len(train_real)} (with entities {len(real_pos)}); "
-          f"real test windows {len(test_items)}; entities dropped by chunking {d1 + d2}; "
+          f"real val windows {len(val_items)} (exact-duplicate entity-free removed: {val_dups}); "
+          f"real test windows {len(test_items)} (exact-duplicate entity-free removed: {test_dups}); entities dropped by chunking {d1 + d2 + d3}; "
           f"real train windows dropped for overlapping spans {n_overlap}; "
           f"real test windows with overlapping spans (kept) {sum(has_overlap(w) for w, _ in test_items)}")
 
@@ -307,16 +381,27 @@ def main():
     train_items = real_pos + syn_pos + decoys + sampled_neg
     rng.shuffle(train_items)
 
-    # ---- leakage guard: drop train windows identical to a test window ---------------
-    test_fps = {fingerprint(w) for w, _ in test_items}
+    # ---- leakage guard on canonical twins -------------------------------------------------
+    heldout_c = {canonical_fingerprint(w) for w, _ in test_items} | {canonical_fingerprint(w) for w, _ in val_items}
     before = len(train_items)
-    train_items = [(w, m) for w, m in train_items if fingerprint(w) not in test_fps]
+    train_items = [(w, m) for w, m in train_items
+                   if m["source"] != "real" or canonical_fingerprint(w) not in heldout_c]
+    n_train_twins = before - len(train_items)
+    train_c = {canonical_fingerprint(w) for w, _ in train_items}
+    test_c = {canonical_fingerprint(w) for w, _ in test_items}
+    before_v = len(val_items)
+    val_items = [(w, m) for w, m in val_items
+                 if canonical_fingerprint(w) not in train_c and canonical_fingerprint(w) not in test_c]
+    n_val_twins = before_v - len(val_items)
     print(f"synthetic positives {len(syn_pos)}, decoys {len(decoys)}, real negatives kept "
-          f"{len(sampled_neg)}/{len(real_neg)}; train windows identical to a test window dropped: {before - len(train_items)}")
+          f"{len(sampled_neg)}/{len(real_neg)} (after capping template twins at 8, from {len(real_neg_all)}); "
+          f"train windows with a canonical twin in val/test dropped: {n_train_twins}; "
+          f"val windows with a twin in train/test dropped: {n_val_twins}")
 
     # ---- write ----------------------------------------------------------------
     out_dir.mkdir(parents=True, exist_ok=True)
     tp, tm = write_split(out_dir, "train", train_items)
+    vp, vm = write_split(out_dir, "val", val_items)
     sp, sm = write_split(out_dir, "test", test_items)
 
     tr_win, tr_span = class_table(train_items)
@@ -332,19 +417,26 @@ def main():
         report_classes[lab] = {"train_windows_real": r, "train_windows_synthetic": s, "train_spans": sp_tr,
                                "test_windows": tw, "test_spans": ts, "policy": policy_of(lab)}
     print(f"\ntrain: {len(train_items)} windows ({sum(1 for w, _ in train_items if w['ner'])} with entities) -> {tp}")
+    print(f"val  : {len(val_items)} windows ({sum(1 for w, _ in val_items if w['ner'])} with entities) -> {vp}")
     print(f"test : {len(test_items)} windows ({sum(1 for w, _ in test_items if w['ner'])} with entities) -> {sp}")
 
     report = {
         "args": vars(args),
         "policy": {"synthetic_only": sorted(cfg.SYNTHETIC_ONLY), "split_20_80": sorted(cfg.SPLIT_20_80),
                    "real_train_fraction": cfg.REAL_TRAIN_FRACTION},
-        "counts": {"train_windows": len(train_items), "test_windows": len(test_items),
+        "counts": {"train_windows": len(train_items), "val_windows": len(val_items), "test_windows": len(test_items),
+                   "val_windows_with_entities": sum(1 for w, _ in val_items if w["ner"]),
+                   "test_windows_with_entities": sum(1 for w, _ in test_items if w["ner"]),
+                   "train_windows_with_entities": sum(1 for w, _ in train_items if w["ner"]),
+                   "test_exact_duplicate_negatives_removed": test_dups,
+                   "val_exact_duplicate_negatives_removed": val_dups,
+                   "val_dropped_as_canonical_twins": n_val_twins,
                    "synthetic_positive": len(syn_pos), "decoys": len(decoys),
                    "real_negative_kept": len(sampled_neg), "real_negative_available": len(real_neg),
-                   "train_dropped_as_test_duplicates": before - len(train_items),
+                   "train_dropped_as_canonical_twins": n_train_twins,
                    "train_dropped_overlapping_spans": n_overlap},
         "classes": report_classes,
-        "sha256": {p.name: sha256_file(p) for p in (tp, sp, tm, sm)},
+        "sha256": {p.name: sha256_file(p) for p in (tp, vp, sp, tm, vm, sm)},
     }
     (out_dir / "build_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     print(f"report -> {out_dir / 'build_report.json'}")
