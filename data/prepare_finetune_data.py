@@ -98,19 +98,24 @@ def build_char_entities(text: str, mask_recon_tokens: bool, seed_prefix: str):
 
 
 def chunk_and_tokenize(text: str, char_entities, max_tokens: int, overlap_tokens: int, max_windows_per_record: int = 3):
-    """Yields {"tokenized_text": [...], "ner": [[s,e,label],...]} dicts, one
-    per window, for windows that fit within max_tokens. Entities that don't
-    align to clean token boundaries, or that straddle a window boundary, are
-    dropped from that window (logged by the caller via return counts).
+    """Yields {"tokenized_text": [...], "ner": [[s,e,label],...]} dicts, one per window.
 
-    max_windows_per_record caps runaway chunking from a small number of
-    extreme outliers -- confirmed in this dataset: 1,050 records (2.2%) are
-    crash-report/stack-trace JSON blobs exceeding 2,000 tokens each (one
-    exceeds 16,000), which without a cap would generate ~50+ largely-identical
-    windows per record and dominate the training set with low-value content.
-    Windows containing an entity are kept first, then earliest windows fill
-    any remaining slots, so a genuine PII example in a long record is never
-    the one that gets dropped."""
+    Window edges never cut through an entity (fix): the old fixed-stride windows could start or end in
+    the middle of a value (e.g. a window beginning at ". 6555 , - 18 . 7253"), the entity was then dropped
+    from that window's gold while its text stayed, and the model was scored a false positive for
+    recognising the fragment (511 of the 22.6k test windows began with such a fragment).  Now a window's
+    end is moved left to the start of an entity it would cut, and the next window's start is moved left
+    to the start of an entity it would cut; the overlap guarantees each entity lies whole in some window.
+
+    max_windows_per_record caps runaway chunking from a small number of extreme outliers -- confirmed in
+    this dataset: 1,050 records (2.2%) are crash-report/stack-trace JSON blobs exceeding 2,000 tokens
+    each (one exceeds 16,000), which without a cap would generate ~50+ largely-identical windows per
+    record and dominate the training set with low-value content.  Windows containing an entity are kept
+    first, then earliest windows fill any remaining slots, so a genuine PII example in a long record is
+    never the one that gets dropped.
+
+    Returns (windows, dropped) where dropped counts entities that could not be mapped onto token
+    boundaries at all (0 after the boundary-safe masking)."""
     tokens = tokenize_with_offsets(text)
     if not tokens:
         if char_entities:
@@ -123,32 +128,43 @@ def chunk_and_tokenize(text: str, char_entities, max_tokens: int, overlap_tokens
             )
         return [], 0
 
-    dropped = 0
+    n = len(tokens)
+    spans, dropped = [], 0               # global token spans (s, e, label), e inclusive
+    for c_start, c_end, label in char_entities:
+        sp = char_span_to_token_span(tokens, c_start, c_end)
+        if sp is None:
+            dropped += 1
+        else:
+            spans.append((sp[0], sp[1], label))
+
+    def fix_start(st):
+        changed = True
+        while changed and st > 0:
+            changed = False
+            for s_, e_, _ in spans:
+                if s_ < st <= e_:        # entity covers tokens st-1 and st
+                    st, changed = s_, True
+        return st
+
+    def fix_end(en, st):
+        changed = True
+        while changed and en < n:
+            changed = False
+            for s_, e_, _ in spans:
+                if s_ < en <= e_ and s_ > st:   # entity covers tokens en-1 and en
+                    en, changed = s_, True
+        return en
+
     windows = []
     start = 0
-    while start < len(tokens):
-        end = min(start + max_tokens, len(tokens))
-        window_tokens = tokens[start:end]
-        window_char_start = window_tokens[0][1]
-        window_char_end = window_tokens[-1][2]
-
-        ner = []
-        for c_start, c_end, label in char_entities:
-            if c_start < window_char_start or c_end > window_char_end:
-                continue  # entity outside this window, or straddles its edge
-            span = char_span_to_token_span(window_tokens, c_start, c_end)
-            if span is None:
-                dropped += 1
-                continue
-            # span indices are relative to window_tokens already since we
-            # passed the sliced list
-            ner.append([span[0], span[1], label])
-
-        windows.append({"tokenized_text": [t[0] for t in window_tokens], "ner": ner})
-
-        if end == len(tokens):
+    while start < n:
+        start = fix_start(start)
+        end = fix_end(min(start + max_tokens, n), start)
+        ner = [[s_ - start, e_ - start, l_] for s_, e_, l_ in spans if s_ >= start and e_ < end]
+        windows.append({"tokenized_text": [t[0] for t in tokens[start:end]], "ner": ner})
+        if end >= n:
             break
-        start = end - overlap_tokens
+        start = max(end - overlap_tokens, start + 1)
 
     if len(windows) > max_windows_per_record:
         with_entities = [w for w in windows if w["ner"]]

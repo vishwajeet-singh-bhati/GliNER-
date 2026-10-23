@@ -100,5 +100,39 @@ class TestLeakageGuards(unittest.TestCase):
         self.assertEqual(len(kept), 3)
 
 
+class TestWindowEdges(unittest.TestCase):
+    def test_no_window_edge_cuts_an_entity(self):
+        # 1000 filler words with a coordinate-like entity straddling every candidate edge position
+        words = [f"w{i}" for i in range(1000)]
+        for pos in (297, 298, 299, 300, 301, 567, 568, 569, 570):
+            text = " ".join(words[:pos]) + " 12.6555,-18.7253 " + " ".join(words[pos:])
+            c_start = text.index("12.6555")
+            ents = [(c_start, c_start + len("12.6555,-18.7253"), "location coordinates")]
+            wins, dropped = chunk_and_tokenize(text, ents, 300, 30, max_windows_per_record=99)
+            self.assertEqual(dropped, 0)
+            seen_whole = 0
+            for w in wins:
+                toks = w["tokenized_text"]
+                joined = " ".join(toks)
+                frag_left = toks[0] in (".", ",", "6555", "7253")
+                self.assertFalse(frag_left and not w["ner"] and ("." == toks[0]), pos)
+                for s_, e_, _ in w["ner"]:
+                    self.assertEqual("".join(toks[s_:e_ + 1]), "12.6555,-18.7253")
+                    seen_whole += 1
+                if not w["ner"]:   # a window without the gold must not contain a piece of the value
+                    self.assertNotIn("6555", joined, pos)
+                    self.assertNotIn("7253", joined, pos)
+            self.assertGreaterEqual(seen_whole, 1, pos)
+            self.assertTrue(all(len(w["tokenized_text"]) <= 300 + 12 for w in wins))
+
+    def test_every_token_is_covered(self):
+        words = [f"w{i}" for i in range(777)]
+        wins, _ = chunk_and_tokenize(" ".join(words), [], 300, 30, max_windows_per_record=99)
+        covered = set()
+        for w in wins:
+            covered.update(w["tokenized_text"])
+        self.assertEqual(covered, set(words))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

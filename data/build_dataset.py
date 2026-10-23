@@ -291,6 +291,10 @@ def main():
                     help="train windows per synthetic-policy class (real + synthetic)")
     ap.add_argument("--neg-ratio", type=float, default=3.0,
                     help="train entity-free windows : positive windows (3.0 ~ the real 14.5%% test prior; the old 1.0 gave a 51%% positive train prior)")
+    ap.add_argument("--test-cap-per-template", type=int, default=5,
+                    help="also write test_capped_finetune.jsonl keeping at most N windows per canonical template "
+                         "(one app can otherwise supply thousands of near-identical windows: 1,239 Roblox windows = "
+                         "5.5%% of the test set and 53%% of its false positives)")
     ap.add_argument("--val-frac", type=float, default=0.10, help="fraction of campaign-routed train flows moved to val (whole apps)")
     ap.add_argument("--decoy-ratio", type=float, default=0.5, help="decoy windows per synthetic positive window")
     ap.add_argument("--cooccur-prob", type=float, default=0.2)
@@ -402,6 +406,13 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     tp, tm = write_split(out_dir, "train", train_items)
     vp, vm = write_split(out_dir, "val", val_items)
+    cap_seen, capped_items = Counter(), []
+    for w, m in test_items:
+        c = canonical_fingerprint(w)
+        if cap_seen[c] < args.test_cap_per_template:
+            cap_seen[c] += 1
+            capped_items.append((w, m))
+    cp, cm = write_split(out_dir, "test_capped", capped_items)
     sp, sm = write_split(out_dir, "test", test_items)
 
     tr_win, tr_span = class_table(train_items)
@@ -418,13 +429,15 @@ def main():
                                "test_windows": tw, "test_spans": ts, "policy": policy_of(lab)}
     print(f"\ntrain: {len(train_items)} windows ({sum(1 for w, _ in train_items if w['ner'])} with entities) -> {tp}")
     print(f"val  : {len(val_items)} windows ({sum(1 for w, _ in val_items if w['ner'])} with entities) -> {vp}")
+    print(f"test_capped: {len(capped_items)} windows ({sum(1 for w, _ in capped_items if w['ner'])} with entities, "
+          f"<= {args.test_cap_per_template} per template) -> {cp}")
     print(f"test : {len(test_items)} windows ({sum(1 for w, _ in test_items if w['ner'])} with entities) -> {sp}")
 
     report = {
         "args": vars(args),
         "policy": {"synthetic_only": sorted(cfg.SYNTHETIC_ONLY), "split_20_80": sorted(cfg.SPLIT_20_80),
                    "real_train_fraction": cfg.REAL_TRAIN_FRACTION},
-        "counts": {"train_windows": len(train_items), "val_windows": len(val_items), "test_windows": len(test_items),
+        "counts": {"test_capped_windows": len(capped_items), "train_windows": len(train_items), "val_windows": len(val_items), "test_windows": len(test_items),
                    "val_windows_with_entities": sum(1 for w, _ in val_items if w["ner"]),
                    "test_windows_with_entities": sum(1 for w, _ in test_items if w["ner"]),
                    "train_windows_with_entities": sum(1 for w, _ in train_items if w["ner"]),
@@ -436,7 +449,7 @@ def main():
                    "train_dropped_as_canonical_twins": n_train_twins,
                    "train_dropped_overlapping_spans": n_overlap},
         "classes": report_classes,
-        "sha256": {p.name: sha256_file(p) for p in (tp, vp, sp, tm, vm, sm)},
+        "sha256": {p.name: sha256_file(p) for p in (tp, vp, sp, cp, tm, vm, sm, cm)},
     }
     (out_dir / "build_report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     print(f"report -> {out_dir / 'build_report.json'}")
