@@ -1,8 +1,20 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Audit-grade GLiNER Evaluator (eval/evaluate_gliner_audit.py)
 Read-only evaluation of base, fine-tuned, and quantized GLiNER checkpoints.
 Never modifies existing datasets or checkpoints. Never logs raw PII text.
+
+Changes vs. the first version (all of them were measured to matter, see the audit notes):
+  * labels: the model is prompted with the labels it was TRAINED on (train_labels.json written by
+    train/finetune_gliner.py, or --labels-file).  The old default prompted all 17 incl. one label with
+    zero training/test spans, which can only add false positives.
+  * chunking: GLiNER's max_len counts WORDS, not subwords.  The old chunker treated 384 as a subword
+    budget minus the label-prompt overhead, which split ~half of the 300-word windows into pieces the
+    model was never trained on.  Default --chunk-unit words (a 300-word window is ONE forward pass).
+  * threshold: chosen on the VALIDATION file (--val-path) and then applied once, exactly, to the test
+    file.  Tuning on test is never done.  A sweep table is reported for transparency.
+  * error breakdown (label confusion / boundary / spurious in entity-free windows ...), per label.
+  * optional batched inference (--batch-size).
 """
 import argparse
 import csv
@@ -276,6 +288,34 @@ class SubwordChunker:
             start = next_start
 
         return chunks, word_subwords
+
+
+class WordChunker:
+    """Chunks by WORD count (GLiNER's max_len unit).  A window with <= max_len words is ONE chunk;
+    longer ones are split into max_len-word chunks with `overlap_words` of overlap.  Same interface as
+    SubwordChunker (chunk_tokens -> (chunks, per-word subword counts))."""
+
+    def __init__(self, subword_counter_fn, labels, max_len: int = 384, overlap_words: int = 30):
+        self.subword_counter_fn = subword_counter_fn
+        self.max_len = max_len
+        self.overlap_words = min(overlap_words, max(0, max_len // 4))
+        self.prompt_overhead = sum(1 + max(1, subword_counter_fn(l)) for l in labels) + 3
+        self.text_budget = max_len        # unit: words
+
+    def chunk_tokens(self, tokens):
+        n = len(tokens)
+        if n == 0:
+            return [], []
+        wsub = [max(1, self.subword_counter_fn(w)) for w in tokens]
+        chunks, start = [], 0
+        while start < n:
+            end = min(start + self.max_len, n)
+            chunks.append(ChunkSpec(start_tok=start, end_tok=end - 1,
+                                    subword_count=self.prompt_overhead + sum(wsub[start:end])))
+            if end == n:
+                break
+            start = end - self.overlap_words
+        return chunks, wsub
 
 
 def build_chunk_string_and_offsets(chunk_tokens: Sequence[str]) -> Tuple[str, List[Tuple[int, int]], Dict[int, int], Dict[int, int]]:
@@ -596,6 +636,77 @@ def build_subword_counter(model):
     return count_subwords
 
 
+def classify_errors(gold: Set[Tuple[int, int, str]], pred: Set[Tuple[int, int, str]]) -> Tuple[Counter, Counter]:
+    """Error taxonomy for one window.  Returns (error_counts, fp_in_entity_free_window_by_label)."""
+    errs: Counter = Counter()
+    ef_by_label: Counter = Counter()
+
+    def overlaps(a, b):
+        return a[0] <= b[1] and b[0] <= a[1]
+
+    for p_ in pred - gold:
+        same_span = [g for g in gold if (g[0], g[1]) == (p_[0], p_[1])]
+        ov_same = [g for g in gold if g[2] == p_[2] and overlaps(g, p_)]
+        ov_other = [g for g in gold if overlaps(g, p_)]
+        if same_span:
+            errs["fp_label_confusion"] += 1
+        elif ov_same:
+            errs["fp_boundary_same_label"] += 1
+        elif ov_other:
+            errs["fp_overlaps_gold_other_label"] += 1
+        elif not gold:
+            errs["fp_in_entity_free_window"] += 1
+            ef_by_label[p_[2]] += 1
+        else:
+            errs["fp_spurious_in_positive_window"] += 1
+    for g in gold - pred:
+        if any((q[0], q[1]) == (g[0], g[1]) for q in pred):
+            errs["fn_label_confusion"] += 1
+        elif any(q[2] == g[2] and overlaps(g, q) for q in pred):
+            errs["fn_boundary"] += 1
+        else:
+            errs["fn_missed"] += 1
+    return errs, ef_by_label
+
+
+def score_store(store, labels: List[str], threshold: float):
+    """Score cached (gold, scored_preds, has_overlap) windows at `threshold`."""
+    full = {l: Counter() for l in labels}
+    clean = {l: Counter() for l in labels}
+    errors: Counter = Counter()
+    ef_labels: Counter = Counter()
+    n_pred_windows_entity_free = 0
+    for gold, scored, has_overlap in store:
+        triples = [(s_, e_, l_) for s_, e_, l_, sc in scored if sc >= threshold]
+        ex_stats = match_spans_one_to_one(gold, triples, labels)
+        for l in labels:
+            full[l].update(ex_stats[l])
+            if not has_overlap:
+                clean[l].update(ex_stats[l])
+        e, ef = classify_errors(set(gold), set(triples))
+        errors.update(e)
+        ef_labels.update(ef)
+        if not gold and triples:
+            n_pred_windows_entity_free += 1
+    n_ef = sum(1 for g, _, _ in store if not g)
+    return full, clean, errors, ef_labels, n_ef, n_pred_windows_entity_free
+
+
+def _predict_many(model, texts, labels, flat_ner, threshold, multi_label, batch_size, state):
+    """Batched inference with a safe fallback to one-by-one predict_entities."""
+    if batch_size > 1 and len(texts) > 1 and not state.get("batch_broken"):
+        try:
+            out = model.inference(texts, labels, flat_ner=flat_ner, threshold=threshold,
+                                  multi_label=multi_label, batch_size=batch_size)
+            if len(out) == len(texts):
+                return out
+        except Exception as exc:
+            state["batch_broken"] = True
+            print(f"  [note] batched inference unavailable ({exc!r}); falling back to one window at a time", flush=True)
+    return [model.predict_entities(t, labels, flat_ner=flat_ner, threshold=threshold, multi_label=multi_label)
+            for t in texts]
+
+
 def evaluate_model_on_dataset(
     model,
     parsed_examples: Sequence[Tuple[int, List[str], List[Tuple[int, int, str]], bool]],
@@ -606,20 +717,33 @@ def evaluate_model_on_dataset(
     allow_enclosing_fallback: bool,
     max_len_override: Optional[int] = None,
     progress_every: int = 1000,
+    chunk_unit: str = "words",
+    sweep: Optional[Sequence[float]] = None,
+    batch_size: int = 1,
 ) -> Dict[str, Any]:
+    """Runs the model ONCE over the windows and scores the cached predictions.
+
+    sweep=None  : inference runs at exactly `threshold` -> headline numbers are exact.
+    sweep=[...] : inference runs at min(sweep + [threshold]); every threshold is scored by filtering the
+                  span scores.  That is exact except for flat_ner's greedy overlap removal, which can
+                  differ slightly between thresholds ("headline_is_exact" says which case applies)."""
     import torch
 
     model_max_len = max_len_override or int(getattr(getattr(model, "config", None), "max_len", 384))
     subword_counter = build_subword_counter(model)
-    chunker = SubwordChunker(subword_counter, labels=labels, max_len=model_max_len)
+    if chunk_unit == "words":
+        chunker = WordChunker(subword_counter, labels=labels, max_len=model_max_len)
+    else:
+        chunker = SubwordChunker(subword_counter, labels=labels, max_len=model_max_len)
 
-    full_totals = {l: Counter() for l in labels}
-    clean_totals = {l: Counter() for l in labels}
+    sweep = sorted(set(float(x) for x in sweep)) if sweep else None
+    run_threshold = min(sweep + [threshold]) if sweep else threshold
 
     chunk_stats = {
+        "chunk_unit": chunk_unit,
         "model_max_len": model_max_len,
         "prompt_overhead_subwords": chunker.prompt_overhead,
-        "text_subword_budget": chunker.text_budget,
+        "text_budget_unit_budget": chunker.text_budget,
         "total_examples_evaluated": len(parsed_examples),
         "single_chunk_examples": 0,
         "multi_chunk_examples": 0,
@@ -632,49 +756,27 @@ def evaluate_model_on_dataset(
         "duplicates_removed_across_chunks": 0,
         "exact_token_boundary_predictions": 0,
         "subtoken_boundary_mismatches": 0,
+        "run_threshold": run_threshold,
     }
 
-    t0 = time.time()
-    with torch.inference_mode():
-        for idx_pos, (_line_idx, tokens, gold_spans, has_overlap) in enumerate(parsed_examples, 1):
-            chunks, word_subwords = chunker.chunk_tokens(tokens)
-            win_total_sub = chunker.prompt_overhead + sum(word_subwords)
-            if win_total_sub > chunk_stats["max_window_subwords_seen"]:
-                chunk_stats["max_window_subwords_seen"] = win_total_sub
-            if win_total_sub > model_max_len:
-                chunk_stats["windows_exceeding_max_len_before_chunking"] += 1
+    store = []
+    state: Dict[str, Any] = {}
+    pending = []   # [(has_overlap, gold, [ (chunk, offsets, start_map, end_map, text) ])]
 
-            if len(chunks) == 1:
-                chunk_stats["single_chunk_examples"] += 1
-            else:
-                chunk_stats["multi_chunk_examples"] += 1
-
-            chunk_stats["total_chunks_executed"] += len(chunks)
-
-            window_raw_preds: List[Tuple[int, int, str, float]] = []
-            for ch in chunks:
-                if ch.exceeded_single_token_budget:
-                    chunk_stats["single_tokens_exceeding_budget"] += 1
-                ch_tokens = tokens[ch.start_tok : ch.end_tok + 1]
-                ch_text, offsets, start_map, end_map = build_chunk_string_and_offsets(ch_tokens)
-
-                raw_ents = model.predict_entities(
-                    ch_text,
-                    labels,
-                    flat_ner=flat_ner,
-                    threshold=threshold,
-                    multi_label=multi_label,
-                )
-                for ent in raw_ents:
+    def flush():
+        if not pending:
+            return
+        texts = [c[4] for _, _, chs in pending for c in chs]
+        preds_all = _predict_many(model, texts, labels, flat_ner, run_threshold, multi_label, batch_size, state)
+        k = 0
+        for has_overlap, gold, chs in pending:
+            window_raw: List[Tuple[int, int, str, float]] = []
+            for (ch, offsets, start_map, end_map, _t) in chs:
+                for ent in preds_all[k]:
                     chunk_stats["raw_chunk_predictions"] += 1
                     mapped, is_exact = map_char_pred_to_tokens(
-                        int(ent["start"]),
-                        int(ent["end"]),
-                        offsets,
-                        start_map,
-                        end_map,
-                        allow_enclosing_fallback=allow_enclosing_fallback,
-                    )
+                        int(ent["start"]), int(ent["end"]), offsets, start_map, end_map,
+                        allow_enclosing_fallback=allow_enclosing_fallback)
                     if mapped is None:
                         chunk_stats["subtoken_boundary_mismatches"] += 1
                         continue
@@ -682,40 +784,67 @@ def evaluate_model_on_dataset(
                         chunk_stats["exact_token_boundary_predictions"] += 1
                     else:
                         chunk_stats["subtoken_boundary_mismatches"] += 1
+                    window_raw.append((ch.start_tok + mapped[0], ch.start_tok + mapped[1],
+                                       str(ent["label"]), float(ent.get("score", 1.0))))
+                k += 1
+            dedup = deduplicate_predictions(window_raw)
+            chunk_stats["deduplicated_predictions"] += len(dedup)
+            chunk_stats["duplicates_removed_across_chunks"] += len(window_raw) - len(dedup)
+            store.append((gold, dedup, has_overlap))
+        pending.clear()
 
-                    g_start = ch.start_tok + mapped[0]
-                    g_end = ch.start_tok + mapped[1]
-                    window_raw_preds.append((g_start, g_end, str(ent["label"]), float(ent.get("score", 1.0))))
+    t0 = time.time()
+    with torch.inference_mode():
+        for idx_pos, (_line_idx, tokens, gold_spans, has_overlap) in enumerate(parsed_examples, 1):
+            chunks, word_subwords = chunker.chunk_tokens(tokens)
+            win_total_sub = chunker.prompt_overhead + sum(word_subwords)
+            chunk_stats["max_window_subwords_seen"] = max(chunk_stats["max_window_subwords_seen"], win_total_sub)
+            if win_total_sub > model_max_len:
+                chunk_stats["windows_exceeding_max_len_before_chunking"] += 1
+            chunk_stats["single_chunk_examples" if len(chunks) == 1 else "multi_chunk_examples"] += 1
+            chunk_stats["total_chunks_executed"] += len(chunks)
 
-            dedup_preds_scored = deduplicate_predictions(window_raw_preds)
-            chunk_stats["deduplicated_predictions"] += len(dedup_preds_scored)
-            chunk_stats["duplicates_removed_across_chunks"] += len(window_raw_preds) - len(dedup_preds_scored)
-
-            pred_triples = [(s, e, l) for s, e, l, _ in dedup_preds_scored]
-            ex_stats = match_spans_one_to_one(gold_spans, pred_triples, labels)
-
-            for l in labels:
-                full_totals[l].update(ex_stats[l])
-                if not has_overlap:
-                    clean_totals[l].update(ex_stats[l])
+            chs = []
+            for ch in chunks:
+                if getattr(ch, "exceeded_single_token_budget", False):
+                    chunk_stats["single_tokens_exceeding_budget"] += 1
+                ch_text, offsets, start_map, end_map = build_chunk_string_and_offsets(tokens[ch.start_tok: ch.end_tok + 1])
+                chs.append((ch, offsets, start_map, end_map, ch_text))
+            pending.append((has_overlap, gold_spans, chs))
+            if len(pending) >= max(1, batch_size):
+                flush()
 
             if progress_every > 0 and idx_pos % progress_every == 0:
                 elapsed = time.time() - t0
-                rate = idx_pos / max(1e-6, elapsed)
-                print(
-                    f"  [{idx_pos}/{len(parsed_examples)}] ({100.0 * idx_pos / len(parsed_examples):.1f}%) "
-                    f"| {rate:.1f} win/s | elapsed {elapsed:.1f}s",
-                    flush=True,
-                )
+                print(f"  [{idx_pos}/{len(parsed_examples)}] ({100.0 * idx_pos / len(parsed_examples):.1f}%) "
+                      f"| {idx_pos / max(1e-6, elapsed):.1f} win/s | elapsed {elapsed:.1f}s", flush=True)
+        flush()
 
     elapsed_total = time.time() - t0
-    return {
+    full, clean, errors, ef_labels, n_ef, n_ef_with_pred = score_store(store, labels, threshold)
+    out = {
         "elapsed_seconds": round(elapsed_total, 2),
         "windows_per_second": round(len(parsed_examples) / max(1e-6, elapsed_total), 2),
+        "headline_threshold": threshold,
+        "headline_is_exact": sweep is None or abs(run_threshold - threshold) < 1e-12,
         "chunking_audit": chunk_stats,
-        "metrics_full_dataset": compute_metrics_table(full_totals, labels),
-        "metrics_clean_subset_no_overlapping_gold": compute_metrics_table(clean_totals, labels),
+        "metrics_full_dataset": compute_metrics_table(full, labels),
+        "metrics_clean_subset_no_overlapping_gold": compute_metrics_table(clean, labels),
+        "error_breakdown": dict(errors),
+        "false_positives_in_entity_free_windows_by_label": dict(ef_labels.most_common()),
+        "entity_free_windows": n_ef,
+        "entity_free_windows_with_a_prediction": n_ef_with_pred,
     }
+    if sweep:
+        table = {}
+        for t in sweep:
+            f_, _c, _e, _l, _n, _w = score_store(store, labels, t)
+            m = compute_metrics_table(f_, labels)
+            table[f"{t:g}"] = {"micro_precision": m["micro"]["precision"], "micro_recall": m["micro"]["recall"],
+                               "micro_f1": m["micro"]["f1"], "macro_f1_supported": m["macro_f1_supported_only"],
+                               "tp": m["micro"]["tp"], "fp": m["micro"]["fp"], "fn": m["micro"]["fn"]}
+        out["threshold_sweep"] = table
+    return out
 
 
 def write_per_class_csv(csv_path: Path, model_name: str, step: Optional[int], metrics_dict: Dict[str, Any]):
@@ -756,19 +885,72 @@ def sanitize_tag(model_spec: str) -> str:
     return model_spec.replace("/", "__").replace("\\", "__").replace(":", "")
 
 
+def find_training_files(model_spec: str) -> Optional[Path]:
+    """Folder holding train_labels.json / training_meta.json for a model path (the model folder,
+    or the output folder that contains the checkpoint-XXXX / best_checkpoint folder)."""
+    p = Path(model_spec)
+    if not p.exists():
+        return None
+    for cand in (p, p.parent):
+        if (cand / "train_labels.json").exists():
+            return cand
+    return None
+
+
+def resolve_labels(model_spec: str, labels_file: Optional[str]) -> Tuple[List[str], str]:
+    if labels_file:
+        return sorted(json.loads(Path(labels_file).read_text(encoding="utf-8"))), f"--labels-file {labels_file}"
+    d = find_training_files(model_spec)
+    if d is not None:
+        return sorted(json.loads((d / "train_labels.json").read_text(encoding="utf-8"))), f"{d / 'train_labels.json'}"
+    return get_configured_labels(), "ALL 17 configured labels (no train_labels.json found: untrained labels can only add false positives)"
+
+
+def parse_dataset(data_path: Path, allowed_labels: Set[str], limit: Optional[int]):
+    summary = ValidationSummary()
+    parsed: List[Tuple[int, List[str], List[Tuple[int, int, str]], bool]] = []
+    with open(data_path, encoding="utf-8") as f:
+        for line_idx, line in enumerate(f):
+            if not line.strip():
+                continue
+            try:
+                raw_obj = json.loads(line)
+            except json.JSONDecodeError:
+                summary.total_lines += 1
+                summary.malformed_examples += 1
+                summary.invalid_example_indices.append(line_idx)
+                continue
+            res = validate_and_parse_example(raw_obj, line_idx, allowed_labels, summary)
+            if res is not None:
+                tokens, dedup_spans, overlaps = res
+                parsed.append((line_idx, tokens, dedup_spans, overlaps))
+            if limit is not None and len(parsed) >= limit:
+                break
+    return summary, parsed
+
+
 def main():
     ap = argparse.ArgumentParser(description="Audit-grade evaluator for AntShield GLiNER models.")
-    ap.add_argument(
-        "--models",
-        nargs="+",
-        help="One or more model paths or HF hub IDs to evaluate on the exact same examples.",
-    )
+    ap.add_argument("--models", nargs="+", help="One or more model paths or HF hub IDs to evaluate on the exact same examples.")
     ap.add_argument("--base-model", default="urchade/gliner_multi_pii-v1", help="Base model architecture reference.")
-    ap.add_argument("--data-path", default="data/test_finetune.jsonl", help="JSONL dataset to evaluate.")
-    ap.add_argument("--output-dir", default="D:/models/eval_audit_results", help="Directory for JSON/CSV reports.")
-    ap.add_argument("--threshold", type=float, default=0.5, help="Entity confidence threshold.")
-    ap.add_argument("--max-types", type=int, default=17, help="model.config.max_types setting.")
-    ap.add_argument("--max-len", type=int, default=None, help="Override model max_len for chunking (default: model.config.max_len).")
+    ap.add_argument("--data-path", default="data/test_finetune.jsonl", help="JSONL dataset to evaluate (the TEST file).")
+    ap.add_argument("--val-path", default=None,
+                    help="VALIDATION jsonl (data/val_finetune.jsonl).  When given, the confidence threshold is "
+                         "selected on it (best micro-F1) and then applied once, exactly, to --data-path.")
+    ap.add_argument("--labels-file", default=None,
+                    help="JSON list of the labels to prompt with (default: train_labels.json next to the model).")
+    ap.add_argument("--output-dir", default="eval_audit_results", help="Directory for JSON/CSV reports.")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="Fixed confidence threshold.  Default: selected on --val-path if given, else 0.5.")
+    ap.add_argument("--sweep", default="0.3,0.4,0.5,0.6,0.7,0.8,0.9",
+                    help="Thresholds for the validation sweep (comma separated).")
+    ap.add_argument("--sweep-test", action="store_true",
+                    help="Also report a threshold sweep on the test file (for transparency only; never used for selection).")
+    ap.add_argument("--max-types", type=int, default=25, help="model.config.max_types (must be >= number of labels).")
+    ap.add_argument("--max-len", type=int, default=None, help="Override model max_len (default: model.config.max_len, in WORDS).")
+    ap.add_argument("--chunk-unit", choices=["words", "subwords"], default="words",
+                    help="'words' (default, GLiNER's own unit) or the legacy 'subwords' budget.")
+    ap.add_argument("--batch-size", type=int, default=8, help="windows per forward pass (1 = one at a time).")
     ap.add_argument("--no-flat-ner", dest="flat_ner", action="store_false", help="Disable flat_ner in predict_entities.")
     ap.add_argument("--multi-label", action="store_true", help="Enable multi_label in predict_entities.")
     ap.add_argument("--allow-enclosing-boundary", action="store_true", help="Snap sub-token char spans to enclosing token.")
@@ -794,37 +976,15 @@ def main():
 
     import torch
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    labels = get_configured_labels()
-    allowed_labels = set(labels)
+    all_known = set(get_configured_labels())
+    sweep_grid = [float(x) for x in args.sweep.split(",") if x.strip()]
 
     data_path = Path(args.data_path)
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {data_path}")
-
     print(f"Auditing dataset: {data_path} ...")
     dataset_sha256 = sha256_file(data_path)
-    val_summary = ValidationSummary()
-    parsed_examples: List[Tuple[int, List[str], List[Tuple[int, int, str]], bool]] = []
-
-    with open(data_path, encoding="utf-8") as f:
-        for line_idx, line in enumerate(f):
-            if not line.strip():
-                continue
-            try:
-                raw_obj = json.loads(line)
-            except json.JSONDecodeError:
-                val_summary.total_lines += 1
-                val_summary.malformed_examples += 1
-                val_summary.invalid_example_indices.append(line_idx)
-                continue
-
-            res = validate_and_parse_example(raw_obj, line_idx, allowed_labels, val_summary)
-            if res is not None:
-                tokens, dedup_spans, overlaps = res
-                parsed_examples.append((line_idx, tokens, dedup_spans, overlaps))
-            if args.limit is not None and len(parsed_examples) >= args.limit:
-                break
-
+    val_summary, parsed_examples = parse_dataset(data_path, all_known, args.limit)
     print(
         f"Dataset validation complete: {val_summary.valid_examples}/{val_summary.total_lines} valid examples | "
         f"unique gold spans={val_summary.valid_unique_gold_spans} | "
@@ -832,10 +992,16 @@ def main():
         f"invalid gold spans={val_summary.invalid_gold_spans} | "
         f"examples with overlapping gold spans={val_summary.examples_with_overlapping_gold}"
     )
-    print(
-        "CONTAMINATION WARNING: train/finetune_gliner.py currently passes test_finetune.jsonl as eval_dataset. "
-        "Do NOT select or tune checkpoints using test_finetune.jsonl metrics."
-    )
+    val_parsed, val_sha = None, None
+    if args.val_path:
+        vp = Path(args.val_path)
+        if not vp.exists():
+            raise FileNotFoundError(f"Validation file not found: {vp}")
+        val_sha = sha256_file(vp)
+        if val_sha == dataset_sha256:
+            raise ValueError("--val-path and --data-path are the same file; threshold would be tuned on the test set.")
+        _vs, val_parsed = parse_dataset(vp, all_known, args.limit)
+        print(f"Validation file: {len(val_parsed)} windows ({sum(1 for x in val_parsed if x[2])} with gold spans)")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -853,36 +1019,73 @@ def main():
 
         step = extract_checkpoint_step(model_spec)
         loader_type = "quantized" if args.quantized else "ordinary"
+        labels, labels_source = resolve_labels(model_spec, args.labels_file)
+        max_types = max(args.max_types, len(labels))
         print(f"\n==== Evaluating [{tag}] (step={step}, loader={loader_type}, device={device}) ====")
+        print(f"Prompt labels ({len(labels)}): from {labels_source}")
+
+        # contamination check against the training run's own record (replaces the old unconditional warning)
+        contamination = {"checked": False}
+        tdir = find_training_files(model_spec)
+        if tdir is not None and (tdir / "training_meta.json").exists():
+            try:
+                meta = json.loads((tdir / "training_meta.json").read_text(encoding="utf-8"))
+                used = meta.get("data_sha256", {})
+                hit = [n for n, h in used.items() if h == dataset_sha256]
+                contamination = {"checked": True, "evaluated_file_was_used_in_training_run": bool(hit), "files": hit}
+                if hit:
+                    print(f"WARNING: {data_path} is the file this model was trained/validated on ({hit}); "
+                          f"these numbers are NOT held-out test numbers.")
+            except Exception as exc:
+                contamination = {"checked": False, "error": repr(exc)}
+        unknown_gold = Counter()
+        for _i, _t, g, _o in parsed_examples:
+            for _s, _e, l in g:
+                if l not in labels:
+                    unknown_gold[l] += 1
+        if unknown_gold:
+            print(f"WARNING: {sum(unknown_gold.values())} gold spans have labels the model is not prompted with "
+                  f"{dict(unknown_gold)}; they count as misses only if you add the label via --labels-file.")
 
         if args.quantized:
             model = load_quantized_checkpoint(
-                model_spec,
-                base_model=args.base_model,
-                device=device,
-                scaling_mode=args.scaling_mode,
-                learnable_scaling=args.learnable_scaling,
-                max_types=args.max_types,
+                model_spec, base_model=args.base_model, device=device,
+                scaling_mode=args.scaling_mode, learnable_scaling=args.learnable_scaling, max_types=max_types,
             )
         else:
-            model = load_ordinary_checkpoint(
-                model_spec,
-                base_model=args.base_model,
-                device=device,
-                max_types=args.max_types,
-            )
+            model = load_ordinary_checkpoint(model_spec, base_model=args.base_model, device=device, max_types=max_types)
+
+        common = dict(
+            model=model, labels=labels, flat_ner=args.flat_ner, multi_label=args.multi_label,
+            allow_enclosing_fallback=args.allow_enclosing_boundary, max_len_override=args.max_len,
+            progress_every=args.progress_every, chunk_unit=args.chunk_unit, batch_size=args.batch_size,
+        )
+
+        threshold_source = "fixed (--threshold)"
+        val_block = None
+        if args.threshold is not None:
+            threshold = args.threshold
+        elif val_parsed is not None:
+            print("Selecting the confidence threshold on the VALIDATION file ...")
+            v = evaluate_model_on_dataset(parsed_examples=val_parsed, threshold=0.5, sweep=sweep_grid, **common)
+            best_t, best_f1 = None, -1.0
+            for t_str, row in v["threshold_sweep"].items():
+                if row["micro_f1"] > best_f1:
+                    best_t, best_f1 = float(t_str), row["micro_f1"]
+            threshold = best_t
+            threshold_source = f"selected on {args.val_path} (best micro-F1 {best_f1:.4f})"
+            val_block = {"val_path": args.val_path, "val_sha256": val_sha, "selected_threshold": threshold,
+                         "sweep": v["threshold_sweep"], "error_breakdown": v["error_breakdown"],
+                         "entity_free_windows": v["entity_free_windows"],
+                         "entity_free_windows_with_a_prediction": v["entity_free_windows_with_a_prediction"]}
+            print(f"  selected threshold = {threshold:g} (val micro-F1 {best_f1:.4f})")
+        else:
+            threshold = 0.5
+            threshold_source = "default 0.5 (no --val-path given; pass one to select the threshold properly)"
 
         eval_out = evaluate_model_on_dataset(
-            model=model,
-            parsed_examples=parsed_examples,
-            labels=labels,
-            threshold=args.threshold,
-            flat_ner=args.flat_ner,
-            multi_label=args.multi_label,
-            allow_enclosing_fallback=args.allow_enclosing_boundary,
-            max_len_override=args.max_len,
-            progress_every=args.progress_every,
-        )
+            parsed_examples=parsed_examples, threshold=threshold,
+            sweep=(sweep_grid if args.sweep_test else None), **common)
 
         full_m = eval_out["metrics_full_dataset"]
         clean_m = eval_out["metrics_clean_subset_no_overlapping_gold"]
@@ -894,13 +1097,17 @@ def main():
             "loader_type": loader_type,
             "base_model": args.base_model,
             "evaluation_settings": {
-                "threshold": args.threshold,
+                "threshold": threshold,
+                "threshold_source": threshold_source,
                 "flat_ner": args.flat_ner,
                 "multi_label": args.multi_label,
                 "allow_enclosing_boundary": args.allow_enclosing_boundary,
-                "max_types": args.max_types,
+                "max_types": max_types,
+                "chunk_unit": args.chunk_unit,
+                "batch_size": args.batch_size,
                 "device": device,
                 "limit": args.limit,
+                "labels_source": labels_source,
             },
             "dataset_audit": {
                 "data_path": str(data_path),
@@ -918,13 +1125,8 @@ def main():
                 "invalid_example_indices_sample": val_summary.invalid_example_indices[:50],
                 "overlapping_example_indices_sample": val_summary.overlapping_example_indices[:100],
             },
-            "test_set_contamination_warning": {
-                "contaminated_eval_split_in_training_script": True,
-                "detail": (
-                    "train/finetune_gliner.py sets val_data = test_finetune.jsonl. "
-                    "Do not select the best checkpoint using test_finetune.jsonl."
-                ),
-            },
+            "training_run_overlap_check": contamination,
+            "validation_threshold_selection": val_block,
             "configured_labels": labels,
             **eval_out,
         }
@@ -933,12 +1135,14 @@ def main():
         write_per_class_csv(csv_out, model_spec, step, full_m)
 
         print(
-            f"Summary [{tag}]: Micro-P={full_m['micro']['precision']:.4f} "
+            f"Summary [{tag}] @thr={threshold:g}: Micro-P={full_m['micro']['precision']:.4f} "
             f"Micro-R={full_m['micro']['recall']:.4f} "
             f"Micro-F1={full_m['micro']['f1']:.4f} | "
-            f"Macro-F1 (17 labels)={full_m['macro_f1_all_configured']:.4f} | "
-            f"Macro-F1 (16 supported)={full_m['macro_f1_supported_only']:.4f}"
+            f"Macro-F1 ({full_m['num_configured_labels']} prompted labels)={full_m['macro_f1_all_configured']:.4f} | "
+            f"Macro-F1 (with test support, {full_m['num_supported_labels']})={full_m['macro_f1_supported_only']:.4f}"
         )
+        print(f"  errors: {eval_out['error_breakdown']}")
+        print(f"  entity-free windows with >=1 prediction: {eval_out['entity_free_windows_with_a_prediction']}/{eval_out['entity_free_windows']}")
         print(f"Saved JSON -> {json_out}")
         print(f"Saved CSV  -> {csv_out}")
 
@@ -948,11 +1152,12 @@ def main():
                 "model_path": model_spec,
                 "checkpoint_step": "" if step is None else step,
                 "loader_type": loader_type,
-                "threshold": args.threshold,
+                "threshold": threshold,
+                "threshold_source": threshold_source,
                 "micro_precision": full_m["micro"]["precision"],
                 "micro_recall": full_m["micro"]["recall"],
                 "micro_f1": full_m["micro"]["f1"],
-                "macro_f1_all_17": full_m["macro_f1_all_configured"],
+                "macro_f1_all_prompted": full_m["macro_f1_all_configured"],
                 "macro_f1_supported": full_m["macro_f1_supported_only"],
                 "clean_subset_micro_f1": clean_m["micro"]["f1"],
                 "clean_subset_macro_f1_supported": clean_m["macro_f1_supported_only"],

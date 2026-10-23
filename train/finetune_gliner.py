@@ -102,6 +102,37 @@ def sanitize_example_in_place(ex, max_window_tokens=256, max_token_chars=128):
     return updated
 
 
+class LabelPromptDataset(torch.utils.data.Dataset):
+    """Gives every example the FULL label list as its prompt (GLiNER's predefined-labels key
+    "ner_labels", see gliner/data_processing/processor.py batch_generate_class_mappings).
+
+    Why: without it GLiNER's collator builds each prompt only from the labels that occur in the
+    example (+ <= max_neg_type_ratio * n_entities random in-batch negatives, which for an
+    entity-free window means NOTHING but a dummy "" label).  The model then never sees
+    "this label is in the prompt and has no match here", so at inference time (all 16 labels
+    prompted) it over-fires: precision ~0.2 / recall ~0.8 in the audit.  With the full label list
+    in every prompt, every absent label is a supervised negative, for positive and negative
+    windows alike -- exactly the inference-time situation.
+    shuffle=True re-orders the labels each time an item is read (position robustness)."""
+
+    def __init__(self, examples, labels, shuffle=True, seed=0):
+        self.examples = examples
+        self.labels = list(labels)
+        self.shuffle = shuffle
+        self.rng = __import__("random").Random(seed)
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, i):
+        ex = dict(self.examples[i])
+        labels = list(self.labels)
+        if self.shuffle:
+            self.rng.shuffle(labels)
+        ex["ner_labels"] = labels
+        return ex
+
+
 def smart_load_state_dict(target_obj, state_dict):
     candidates = []
     if hasattr(target_obj, "model") and isinstance(target_obj.model, torch.nn.Module):
@@ -160,19 +191,36 @@ def clear_inference_tensors(root):
                         n += 1
     return n
 
-def evaluate_gliner_spans(gliner_wrapper, dataset_slice, label_list, threshold=0.5):
+def _prf(tp, fp, fn):
+    p = (tp / (tp + fp)) * 100.0 if (tp + fp) > 0 else 0.0
+    r = (tp / (tp + fn)) * 100.0 if (tp + fn) > 0 else 0.0
+    f = (2.0 * tp / (2.0 * tp + fp + fn)) * 100.0 if (2 * tp + fp + fn) > 0 else 0.0
+    return p, r, f
+
+
+def evaluate_gliner_spans(gliner_wrapper, dataset_slice, label_list, threshold=0.5, thresholds=None):
+    """Exact-span micro P/R/F1 over `dataset_slice` (windows, positives AND negatives).
+
+    thresholds: optional iterable.  Inference runs ONCE at min(thresholds) and the metrics are
+    recomputed for every threshold by filtering on the span score; the result is reported for the
+    threshold with the best F1 (key "threshold").  Filtering a low-threshold run is an
+    approximation of re-running at the higher threshold (overlap resolution can differ slightly);
+    eval/evaluate_gliner_audit.py does the exact thing for the final numbers."""
+    empty = {"precision": 0.0, "recall": 0.0, "f1": 0.0, "acc": 0.0, "tok_acc": 0.0, "tp": 0, "fp": 0, "fn": 0,
+             "threshold": threshold, "predict_errors": 0}
     if not dataset_slice or not label_list:
-        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "acc": 0.0, "tp": 0, "fp": 0, "fn": 0}
+        return empty
+    ths = sorted(set(thresholds)) if thresholds else [threshold]
+    run_th = ths[0]
 
     core_mod = gliner_wrapper.model if hasattr(gliner_wrapper, "model") else gliner_wrapper
     was_training = core_mod.training
     core_mod.eval()
 
-    tp = 0
-    fp = 0
-    fn = 0
-    token_hits = 0
+    counts = {t: [0, 0, 0] for t in ths}          # tp, fp, fn
+    hits = {t: 0 for t in ths}
     token_total = 0
+    predict_errors = 0
 
     try:
         with torch.no_grad():
@@ -182,9 +230,7 @@ def evaluate_gliner_spans(gliner_wrapper, dataset_slice, label_list, threshold=0
                 if not tokens:
                     continue
 
-                char_starts = []
-                char_ends = []
-                cur = 0
+                char_starts, char_ends, cur = [], [], 0
                 for i, tok in enumerate(tokens):
                     if i > 0:
                         cur += 1
@@ -193,8 +239,7 @@ def evaluate_gliner_spans(gliner_wrapper, dataset_slice, label_list, threshold=0
                     char_ends.append(cur)
                 text = " ".join(tokens)
 
-                gold_spans = set()
-                gold_tok_labels = {}
+                gold_spans, gold_tok_labels = set(), {}
                 for span in ner:
                     if len(span) >= 3:
                         s, e, lbl = int(span[0]), int(span[1]), str(span[2])
@@ -202,49 +247,49 @@ def evaluate_gliner_spans(gliner_wrapper, dataset_slice, label_list, threshold=0
                             gold_spans.add((char_starts[s], char_ends[e], lbl))
                             for tidx in range(s, e + 1):
                                 gold_tok_labels[tidx] = lbl
+                token_total += len(gold_tok_labels)
 
                 try:
-                    preds = gliner_wrapper.predict_entities(text, label_list, threshold=threshold)
-                except Exception:
+                    preds = gliner_wrapper.predict_entities(text, label_list, threshold=run_th)
+                except Exception as exc:   # counted and reported, never silently turned into "no entities"
+                    predict_errors += 1
+                    if predict_errors <= 3:
+                        print(f"  [eval warning] predict_entities failed: {exc!r}", flush=True)
                     preds = []
 
-                pred_spans = set()
-                pred_tok_labels = {}
-                for p in preds:
-                    ps, pe, plbl = int(p["start"]), int(p["end"]), str(p["label"])
-                    pred_spans.add((ps, pe, plbl))
-                    for tidx in range(len(tokens)):
-                        if char_starts[tidx] >= ps and char_ends[tidx] <= pe:
-                            pred_tok_labels[tidx] = plbl
-
-                tp += len(gold_spans & pred_spans)
-                fp += len(pred_spans - gold_spans)
-                fn += len(gold_spans - pred_spans)
-
-                for tidx, glbl in gold_tok_labels.items():
-                    token_total += 1
-                    if pred_tok_labels.get(tidx) == glbl:
-                        token_hits += 1
+                for t in ths:
+                    pred_spans, pred_tok_labels = set(), {}
+                    for p in preds:
+                        if float(p.get("score", 1.0)) < t:
+                            continue
+                        ps, pe, plbl = int(p["start"]), int(p["end"]), str(p["label"])
+                        pred_spans.add((ps, pe, plbl))
+                        for tidx in range(len(tokens)):
+                            if char_starts[tidx] >= ps and char_ends[tidx] <= pe:
+                                pred_tok_labels[tidx] = plbl
+                    c = counts[t]
+                    c[0] += len(gold_spans & pred_spans)
+                    c[1] += len(pred_spans - gold_spans)
+                    c[2] += len(gold_spans - pred_spans)
+                    hits[t] += sum(1 for tidx, g in gold_tok_labels.items() if pred_tok_labels.get(tidx) == g)
     finally:
         if was_training:
             core_mod.train()
         clear_inference_tensors(core_mod)
 
-    precision = (tp / (tp + fp)) * 100.0 if (tp + fp) > 0 else 0.0
-    recall = (tp / (tp + fn)) * 100.0 if (tp + fn) > 0 else 0.0
-    f1 = (2.0 * tp / (2.0 * tp + fp + fn)) * 100.0 if (2 * tp + fp + fn) > 0 else 0.0
-    tok_acc = (token_hits / token_total) * 100.0 if token_total > 0 else recall
+    best_t = max(ths, key=lambda t: (_prf(*counts[t])[2], -abs(t - threshold)))
+    tp, fp, fn = counts[best_t]
+    precision, recall, f1 = _prf(tp, fp, fn)
+    tok_acc = (hits[best_t] / token_total) * 100.0 if token_total > 0 else recall
     acc = 0.5 * tok_acc + 0.5 * recall if token_total > 0 else recall
     return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "acc": acc,
-        "tok_acc": tok_acc,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
+        "precision": precision, "recall": recall, "f1": f1, "acc": acc, "tok_acc": tok_acc,
+        "tp": tp, "fp": fp, "fn": fn, "threshold": best_t, "predict_errors": predict_errors,
+        "by_threshold": {t: dict(zip(("precision", "recall", "f1"), _prf(*counts[t]))) for t in ths},
     }
+
+
+VAL_THRESHOLDS = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
 
 
 def find_latest_checkpoint(output_dir: Path):
@@ -437,7 +482,8 @@ class CleanTrainingLoggerCallback(TrainerCallback):
             try:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                metrics = trainer.evaluate(eval_dataset=self.val_eval_subset[:100])
+                metrics = trainer.evaluate(
+                    eval_dataset=LabelPromptDataset(self.val_eval_subset[:100], self.all_labels, shuffle=False))
                 raw_eval_loss = float(metrics.get("eval_loss", float("nan")))
                 if not math.isnan(raw_eval_loss):
                     # Normalize GLiNER unreduced eval loss to match grad_accum-scaled training loss
@@ -446,7 +492,8 @@ class CleanTrainingLoggerCallback(TrainerCallback):
                 print(f"  [Note] Val loss calc skipped: {e}", flush=True)
 
         val_stats = evaluate_gliner_spans(
-            self.gliner_wrapper, self.val_eval_subset, self.all_labels, threshold=0.5
+            self.gliner_wrapper, self.val_eval_subset, self.all_labels, threshold=0.5,
+            thresholds=VAL_THRESHOLDS,
         )
         val_acc = val_stats["acc"]
         val_f1 = val_stats["f1"]
@@ -475,7 +522,8 @@ class CleanTrainingLoggerCallback(TrainerCallback):
         print(f"Validation Loss : {val_loss_str}", flush=True)
         print(f"Train Accuracy  : {train_acc:.2f}% (Train F1: {train_f1:.2f}%)", flush=True)
         print(
-            f"Validation Acc  : {val_acc:.2f}% (Val F1: {val_f1:.2f}% | P: {val_p:.2f}% | R: {val_r:.2f}%)",
+            f"Validation Acc  : {val_acc:.2f}% (Val F1: {val_f1:.2f}% | P: {val_p:.2f}% | R: {val_r:.2f}% "
+            f"@ best threshold {val_stats['threshold']:.2f}; predict errors: {val_stats['predict_errors']})",
             flush=True,
         )
         print(f"Test Perplexity : {ppl_str}", flush=True)
@@ -496,6 +544,7 @@ class CleanTrainingLoggerCallback(TrainerCallback):
             "val_precision": round(val_p, 2),
             "val_recall": round(val_r, 2),
             "val_f1": round(val_f1, 2),
+            "val_threshold": val_stats["threshold"],
             "is_best": is_best,
         }
         self.leaderboard.append(row)
@@ -529,6 +578,7 @@ class CleanTrainingLoggerCallback(TrainerCallback):
                 "val_precision": round(val_stats["precision"], 2),
                 "val_recall": round(val_stats["recall"], 2),
                 "val_f1": round(val_stats["f1"], 2),
+                "val_threshold": val_stats["threshold"],
                 "tp": val_stats["tp"],
                 "fp": val_stats["fp"],
                 "fn": val_stats["fn"],
@@ -543,7 +593,7 @@ class CleanTrainingLoggerCallback(TrainerCallback):
             return
         keys = [
             "step", "tag", "epoch", "train_loss", "val_loss",
-            "train_acc", "train_f1", "val_acc", "val_precision", "val_recall", "val_f1", "is_best"
+            "train_acc", "train_f1", "val_acc", "val_precision", "val_recall", "val_f1", "val_threshold", "is_best"
         ]
         with open(self.history_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=keys)
@@ -577,7 +627,20 @@ def main():
     ap.add_argument("--base-model", default="urchade/gliner_multi_pii-v1")
     ap.add_argument("--output-dir", default="models/antshield-gliner-v1")
     ap.add_argument("--max-steps", type=int, default=2000)
-    ap.add_argument("--learning-rate", type=float, default=5e-6)
+    ap.add_argument("--learning-rate", type=float, default=1e-5,
+                    help="LR of the backbone encoder (token_rep_layer)")
+    ap.add_argument("--others-lr", type=float, default=5e-5,
+                    help="LR of everything that is not the encoder (span/prompt heads, projections). "
+                         "Before this flag the heads trained at the same 5e-6 as the encoder.")
+    ap.add_argument("--qat-scale-lr", type=float, default=1e-3,
+                    help="LR of the E8 per-row learnable scales (theta_beta). At 5e-6 they could not move.")
+    ap.add_argument("--init-from", default=None,
+                    help="Folder with a pytorch_model.bin (e.g. the best FP checkpoint) loaded BEFORE "
+                         "quantisation, so QAT starts from a fine-tuned full-precision model.")
+    ap.add_argument("--val-file", default="val_finetune.jsonl",
+                    help="file in --data-dir used for validation / best-checkpoint selection")
+    ap.add_argument("--check-prompts", action="store_true",
+                    help="print the label prompt GLiNER's collator builds for a few windows and exit")
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--grad-accum", type=int, default=8)
@@ -588,11 +651,13 @@ def main():
     ap.add_argument("--no-learnable-scaling", dest="learnable_scaling", action="store_false")
     ap.add_argument("--resume-from-checkpoint", default=None,
                     help="Path to checkpoint-XXXX folder, or 'auto' to pick latest in --output-dir.")
-    ap.add_argument("--max-window-tokens", type=int, default=256)
+    ap.add_argument("--max-window-tokens", type=int, default=0,
+                    help="0 = keep the 300-token windows as built (default). 256 re-introduces the old centre-crop "
+                         "that silently removed spans/negatives; use only if you run out of VRAM.")
     ap.add_argument("--max-token-chars", type=int, default=128)
     ap.add_argument("--max-subwords", type=int, default=1024,
                     help="Drop training windows longer than this many subwords (0 disables).")
-    ap.add_argument("--val-samples", type=int, default=300)
+    ap.add_argument("--val-samples", type=int, default=600)
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--save-steps", type=int, default=0, help="0 = save once per epoch")
     ap.add_argument("--vram-fraction", type=float, default=0.88)
@@ -611,8 +676,14 @@ def main():
     precision_kwargs = {"bf16": True} if use_bf16 else {"fp16": args.fp16}
 
     raw_train = load_jsonl(Path(args.data_dir) / "train_finetune.jsonl")
-    raw_val = load_jsonl(Path(args.data_dir) / "test_finetune.jsonl")
+    val_path = Path(args.data_dir) / args.val_file
+    if not val_path.exists():
+        raise FileNotFoundError(
+            f"{val_path} not found. Rebuild the data with data/build_dataset.py (it now writes a real "
+            f"val split). Refusing to fall back to test_finetune.jsonl: that would tune on the test set.")
+    raw_val = load_jsonl(val_path)
 
+    # The label set the model is trained (and must be evaluated) on: every label with >= 1 train span.
     all_labels = sorted({
         str(span[2])
         for ex in raw_train
@@ -625,20 +696,17 @@ def main():
         for ex in raw_train
     ]
 
-    val_positive = [
-        sanitize_example_in_place(ex, args.max_window_tokens, args.max_token_chars)
-        for ex in raw_val
-        if ex.get("ner")
-    ]
-    val_slice = val_positive[: args.val_samples] if len(val_positive) >= 50 else [
-        sanitize_example_in_place(ex, args.max_window_tokens, args.max_token_chars)
-        for ex in raw_val[: args.val_samples]
-    ]
+    # Validation slice keeps the natural mix of positive AND entity-free windows (the old code used
+    # positives only, from the TEST file, so precision on negatives was never measured).
+    import random as _random
+    _rng = _random.Random(0)
+    val_all = [sanitize_example_in_place(ex, args.max_window_tokens, args.max_token_chars) for ex in raw_val]
+    val_slice = _rng.sample(val_all, min(args.val_samples, len(val_all)))
     train_positive = [ex for ex in train_data if ex.get("ner")][:200]
 
     print(
         f"Loaded {len(train_data)} training windows and {len(val_slice)} validation windows "
-        f"across {len(all_labels)} PII entity types."
+        f"({sum(1 for e in val_slice if e['ner'])} with entities) across {len(all_labels)} PII entity types."
     )
 
     model = GLiNER.from_pretrained(args.base_model, local_files_only=True)
@@ -653,8 +721,29 @@ def main():
         train_positive = [ex for ex in train_data if ex.get("ner")][:200]
 
     if hasattr(model, "config"):
-        model.config.max_types = args.max_types
-        print(f"Set model.config.max_types = {args.max_types}")
+        model.config.max_types = max(args.max_types, len(all_labels))
+        print(f"Set model.config.max_types = {model.config.max_types} (all {len(all_labels)} labels fit in every prompt)")
+
+    if args.init_from:
+        init_bin = Path(args.init_from) / "pytorch_model.bin"
+        if not init_bin.exists():
+            raise FileNotFoundError(f"--init-from: {init_bin} not found")
+        sd0 = torch.load(str(init_bin), map_location="cpu")
+        matched0, total0, miss0, unexp0 = smart_load_state_dict(model, sd0)
+        print(f"Initialised from {args.init_from}: {matched0}/{total0} tensors (missing={len(miss0)}, unexpected={len(unexp0)})")
+        if matched0 < 0.9 * total0:
+            raise RuntimeError("--init-from matched <90% of the model tensors; wrong checkpoint?")
+        del sd0
+
+    if args.check_prompts:
+        probe = [train_data[i] for i in range(0, len(train_data), max(1, len(train_data) // 6))][:6]
+        ds_probe = LabelPromptDataset(probe, all_labels)
+        c2i, _ = model.data_processor.batch_generate_class_mappings([ds_probe[i] for i in range(len(ds_probe))], key="ner")
+        for ex, m in zip(probe, c2i):
+            print(f"window with {len(ex['ner'])} entities {sorted({x[2] for x in ex['ner']})}\n   prompt has {len(m)} labels: {list(m)}")
+        ok = all(len(m) == len(all_labels) for m in c2i)
+        print("CHECK-PROMPTS:", "PASS - every window is prompted with all labels" if ok else "FAIL")
+        sys.exit(0 if ok else 1)
 
     if args.quantize:
         print(f"Quantizing backbone encoder(s), scaling_mode={args.scaling_mode} ...")
@@ -759,17 +848,56 @@ def main():
             print(f"Resuming Trainer state, optimizer, and scheduler from: {resume_ckpt}", flush=True)
         return orig_train(self, *t_args, **t_kwargs)
 
+    orig_create_optimizer = TrainerCls.create_optimizer
+
+    def patched_create_optimizer(self):
+        opt = orig_create_optimizer(self)
+        if args.quantize and args.qat_scale_lr is not None and not getattr(self, "_scale_group_done", False):
+            self._scale_group_done = True
+            theta = {id(p) for n, p in self.model.named_parameters() if n.endswith("theta_beta") and p.requires_grad}
+            if theta:
+                moved = []
+                for g in opt.param_groups:
+                    keep = [p for p in g["params"] if id(p) not in theta]
+                    moved += [p for p in g["params"] if id(p) in theta]
+                    g["params"] = keep
+                opt.add_param_group({"params": moved, "lr": args.qat_scale_lr, "weight_decay": 0.0})
+                print(f"[optimizer] {len(moved)} E8 scale tensors (theta_beta) -> own group, lr={args.qat_scale_lr}", flush=True)
+        return opt
+
+    TrainerCls.create_optimizer = patched_create_optimizer
     TrainerCls.__init__ = patched_init
     TrainerCls._load_from_checkpoint = patched_load_from_checkpoint
     TrainerCls.training_step = patched_training_step
     TrainerCls.train = patched_train
 
+    out_dir_p = Path(args.output_dir)
+    out_dir_p.mkdir(parents=True, exist_ok=True)
+    (out_dir_p / "train_labels.json").write_text(json.dumps(all_labels, indent=2), encoding="utf-8")
+    import hashlib
+    def _sha(p):
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    (out_dir_p / "training_meta.json").write_text(json.dumps({
+        "labels": all_labels, "args": vars(args), "n_train_windows": len(train_data),
+        "n_val_windows": len(val_slice), "quantized": bool(args.quantize),
+        "data_sha256": {n: _sha(Path(args.data_dir) / n) for n in ("train_finetune.jsonl", args.val_file)},
+        "note": "evaluate with the labels in train_labels.json (eval/evaluate_gliner_audit.py --labels-file)",
+    }, indent=2, default=str), encoding="utf-8")
+
+    train_ds = LabelPromptDataset(train_data, all_labels, shuffle=True)
+    val_ds = LabelPromptDataset(val_slice[:100], all_labels, shuffle=False)
+
     trainer = model.train_model(
-        train_dataset=train_data,
-        eval_dataset=val_slice,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
         output_dir=args.output_dir,
         max_steps=args.max_steps,
         learning_rate=args.learning_rate,
+        others_lr=args.others_lr,
         weight_decay=args.weight_decay,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
