@@ -252,7 +252,7 @@ def labels_of(w):
 
 def write_split(out_dir, name, items):
     p, m = out_dir / f"{name}_finetune.jsonl", out_dir / f"{name}_manifest.jsonl"
-    with open(p, "w", encoding="utf-8") as fp, open(m, "w", encoding="utf-8") as fm:
+    with open(p, "w", encoding="utf-8", newline="\n") as fp, open(m, "w", encoding="utf-8", newline="\n") as fm:
         for i, (w, meta) in enumerate(items):
             fp.write(json.dumps(w) + "\n")  # same serialisation as prepare_finetune_data
             fm.write(json.dumps({"i": i, **meta, "labels": labels_of(w)}) + "\n")
