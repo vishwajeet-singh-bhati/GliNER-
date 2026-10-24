@@ -8,12 +8,17 @@ Design notes
  * recon_synthesizer does not Luhn-check IMEI/ICCID/IMSI, so ~25% of the numeric
    IDs here are also non-Luhn / random: the model must not key on checksum validity.
  * Decoys look like injected fields but are not PII (timestamps, hashes, versions).
-   Their shapes avoid every PII shape: no 15-digit, 19/20-digit, uuid, 16-hex,
-   email- or phone-like values.
+   Their shapes avoid every PII shape (15-digit, 19/20-digit, 16-hex, email- or
+   phone-like values), with ONE deliberate exception: UUID-shaped values under
+   explicit non-advertiser keys (session_id, request_id, ...).  Real traffic is full
+   of such UUIDs and they are NOT advertising ids; without these hard negatives the
+   model learns "any UUID next to another UUID is an advertiser id".  The keys never
+   overlap with KEYS['advertiser id'] or NEUTRAL_KEYS (which PII values also use).
 """
 import random
 import string
 
+from pii_shapes import uuid4
 from synth_vocab import CITIES, EMAIL_DOMAINS, FIRST_NAMES, LAST_NAMES, PASSWORD_WORDS
 
 _UPPER_ALNUM = string.ascii_uppercase + string.digits
@@ -163,9 +168,19 @@ def generate_value(label: str, rng: random.Random) -> str:
     return GENERATORS[label](rng)
 
 
+UUID_DECOY_KEYS = ["session_id", "request_id", "trace_id", "event_id", "transaction_id",
+                   "correlation_id", "sessionid", "requestid", "traceid", "batch_id", "visit_id"]
+
+
 def decoy_field(rng: random.Random):
     """(key, value) of a plausible non-PII field. Shapes chosen to avoid every PII shape."""
-    kind = rng.randrange(9)
+    kind = rng.randrange(13)
+    if kind >= 9:   # 4 of 13 draws: UUID-shaped non-PII ids
+        key = rng.choice(UUID_DECOY_KEYS)
+        val = uuid4(rng)
+        if rng.random() < 0.25:
+            val = val.upper()
+        return key, val
     if kind == 0:
         return "ts", str(rng.randint(1_500_000_000_000, 1_700_000_000_000))
     if kind == 1:
