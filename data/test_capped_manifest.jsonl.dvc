@@ -1,0 +1,5 @@
+outs:
+- md5: 5519a4fd787dad5c60074c3d8f5580ce
+  size: 2618773
+  hash: md5
+  path: test_capped_manifest.jsonl
