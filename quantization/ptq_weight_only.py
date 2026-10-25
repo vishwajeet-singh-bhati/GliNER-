@@ -153,9 +153,20 @@ def main():
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     torch.save(new_sd, str(out / "pytorch_model.bin"))
-    for extra in ("train_labels.json", "gliner_config.json"):
-        if (ck / extra).exists():
-            shutil.copy(ck / extra, out / extra)
+    # Copy every small non-weight file (config, tokenizer files with GLiNER's added special tokens, labels):
+    # without them GLiNER rebuilds a plain tokenizer and refuses to load.
+    skip = {"pytorch_model.bin", "model.safetensors", "optimizer.pt", "scheduler.pt", "training_args.bin",
+            "scaler.pt", "ptq_report.json"}
+    copied = []
+    for f in ck.iterdir():
+        if f.is_file() and f.name not in skip and not f.name.startswith("rng_state") and f.stat().st_size < 64e6:
+            shutil.copy(f, out / f.name)
+            copied.append(f.name)
+    for extra in ("train_labels.json", "gliner_config.json"):      # sometimes only in the parent run dir
+        if extra not in copied and (ck.parent / extra).exists():
+            shutil.copy(ck.parent / extra, out / extra)
+            copied.append(extra)
+    print("copied alongside the weights:", ", ".join(sorted(copied)) or "(nothing)")
     (out / "ptq_report.json").write_text(json.dumps({
         "bits": bits, "group_size": args.group_size, "edge_size_mb": round(total / 1e6, 1),
         "fp32_size_mb": round(rep["fp32_total_bytes"] / 1e6, 1),
