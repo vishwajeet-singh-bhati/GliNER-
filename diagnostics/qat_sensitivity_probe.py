@@ -45,7 +45,9 @@ def quantize_selected(hf_model: nn.Module, pred, scaling_mode: str, min_features
                 continue
             parent_name, _, child = qual.rpartition(".")
             parent = layer.get_submodule(parent_name) if parent_name else layer
-            setattr(parent, child, E8QATLinear.from_linear(mod, scaling_mode=scaling_mode, learnable=False))
+            new = E8QATLinear.from_linear(mod, scaling_mode=scaling_mode, learnable=False)
+            new = new.to(device=mod.weight.device, dtype=mod.weight.dtype)   # from_linear builds on the CPU
+            setattr(parent, child, new)
             n += 1
     return n
 
