@@ -34,7 +34,7 @@ from e8_quant import E8QATLinear  # noqa: E402
 
 
 # ---------------------------------------------------------------- helpers (pure, unit-testable)
-def quantize_selected(hf_model: nn.Module, pred, scaling_mode: str, min_features: int = 64) -> int:
+def quantize_selected(hf_model: nn.Module, pred, scaling_mode: str, min_features: int = 64, codebook_bits: int = 8) -> int:
     """Replace the nn.Linear layers of hf_model.encoder.layer[i] for which pred(i, qualified_name) is True."""
     n = 0
     for i, layer in enumerate(hf_model.encoder.layer):
@@ -45,7 +45,7 @@ def quantize_selected(hf_model: nn.Module, pred, scaling_mode: str, min_features
                 continue
             parent_name, _, child = qual.rpartition(".")
             parent = layer.get_submodule(parent_name) if parent_name else layer
-            new = E8QATLinear.from_linear(mod, scaling_mode=scaling_mode, learnable=False)
+            new = E8QATLinear.from_linear(mod, scaling_mode=scaling_mode, learnable=False, codebook_bits=codebook_bits)
             new = new.to(device=mod.weight.device, dtype=mod.weight.dtype)   # from_linear builds on the CPU
             setattr(parent, child, new)
             n += 1
@@ -104,7 +104,7 @@ def make_hybrid_configs(n_layers: int):
     return out
 
 
-def run_probe(hf_model, ids, mask, scaling_mode, log=print, extended=False):
+def run_probe(hf_model, ids, mask, scaling_mode, log=print, extended=False, codebook_bits=8):
     hf_model.eval()
     h_fp = run_hidden(hf_model, ids, mask)
     results = []
@@ -113,7 +113,7 @@ def run_probe(hf_model, ids, mask, scaling_mode, log=print, extended=False):
         configs += make_hybrid_configs(len(hf_model.encoder.layer))
     for name, pred in configs:
         q = copy.deepcopy(hf_model)
-        n = quantize_selected(q, pred, scaling_mode)
+        n = quantize_selected(q, pred, scaling_mode, codebook_bits=codebook_bits)
         q.eval()
         h_q = run_hidden(q, ids, mask, bf16=name.endswith("(bf16 autocast)"))
         per_layer = compare(h_fp, h_q, mask)
@@ -158,6 +158,7 @@ def main():
     ap.add_argument("--max-length", type=int, default=256)
     ap.add_argument("--scaling-mode", default="row_sigma_learnable")
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--codebook-bits", type=int, default=8, choices=[8, 16], help="8 = current 1 bit/weight codebook, 16 = 2 bits/weight")
     ap.add_argument("--extended", action="store_true", help="also test hybrid configs that keep sensitive parts in FP")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -196,7 +197,8 @@ def main():
     hf = hf.float().to(dev)
     ids, mask = enc["input_ids"].to(dev), enc["attention_mask"].to(dev)
     print(f"probe on {len(texts)} windows, {int(mask.sum())} tokens, device={dev}, layers={len(hf.encoder.layer)}")
-    results = run_probe(hf, ids, mask, args.scaling_mode, extended=args.extended)
+    print(f"codebook_bits={args.codebook_bits} ({'2' if args.codebook_bits == 16 else '1'} bit/weight)")
+    results = run_probe(hf, ids, mask, args.scaling_mode, extended=args.extended, codebook_bits=args.codebook_bits)
     allrow = next(r for r in results if r[0] == "all")
     print("\nper-layer cosine for 'all' (embedding output, then blocks 1..N):")
     print("  " + " ".join(f"{c:.2f}" for c, _, _, _ in allrow[2]))

@@ -3,15 +3,15 @@ import torch
 import torch.nn as nn
 from e8_quant import E8QATLinear
 
-def replace_linears_with_e8qat(module: nn.Module, min_features: int = 64, scaling_mode: str = "block_max", learnable: bool = True) -> int:
+def replace_linears_with_e8qat(module: nn.Module, min_features: int = 64, scaling_mode: str = "block_max", learnable: bool = True, codebook_bits: int = 8) -> int:
     n_replaced = 0
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
             if child.in_features >= min_features and child.out_features >= 2:
-                setattr(module, name, E8QATLinear.from_linear(child, scaling_mode=scaling_mode, learnable=learnable))
+                setattr(module, name, E8QATLinear.from_linear(child, scaling_mode=scaling_mode, learnable=learnable, codebook_bits=codebook_bits))
                 n_replaced += 1
         else:
-            n_replaced += replace_linears_with_e8qat(child, min_features, scaling_mode=scaling_mode, learnable=learnable)
+            n_replaced += replace_linears_with_e8qat(child, min_features, scaling_mode=scaling_mode, learnable=learnable, codebook_bits=codebook_bits)
     return n_replaced
 
 def get_backbone_encoders(gliner_model) -> list:
@@ -28,18 +28,18 @@ def get_backbone_encoders(gliner_model) -> list:
         raise AttributeError("Could not find bert_layer or labels_encoder under model.token_rep_layer.")
     return encoders
 
-def quantize_gliner_encoder(gliner_model, scaling_mode: str = "block_max", learnable: bool = True, min_features: int = 64) -> int:
+def quantize_gliner_encoder(gliner_model, scaling_mode: str = "block_max", learnable: bool = True, min_features: int = 64, codebook_bits: int = 8) -> int:
     total = 0
     for name, encoder in get_backbone_encoders(gliner_model):
-        n = replace_linears_with_e8qat(encoder, min_features=min_features, scaling_mode=scaling_mode, learnable=learnable)
+        n = replace_linears_with_e8qat(encoder, min_features=min_features, scaling_mode=scaling_mode, learnable=learnable, codebook_bits=codebook_bits)
         print(f"  quantized {n} Linear layers in {name}")
         total += n
     return total
 
-def load_quantized_gliner(base_model_name: str, checkpoint_dir: str, scaling_mode: str = "block_max", learnable: bool = True, min_features: int = 64):
+def load_quantized_gliner(base_model_name: str, checkpoint_dir: str, scaling_mode: str = "block_max", learnable: bool = True, min_features: int = 64, codebook_bits: int = 8):
     from gliner import GLiNER
     model = GLiNER.from_pretrained(base_model_name, local_files_only=True)
-    n = quantize_gliner_encoder(model, scaling_mode=scaling_mode, learnable=learnable, min_features=min_features)
+    n = quantize_gliner_encoder(model, scaling_mode=scaling_mode, learnable=learnable, min_features=min_features, codebook_bits=codebook_bits)
     print(f"Reconstructed quantized architecture ({n} layers) before loading checkpoint weights")
     
     safetensors_path = os.path.join(checkpoint_dir, "model.safetensors")

@@ -26,7 +26,13 @@ WHAT CHANGED vs. the original (numerics of the quantizer itself are unchanged):
      outputs and gradients, see test_e8_equivalence.py).
   3. step_count is a plain Python int (no GPU sync), as in your local patch.
 
-The codebook is NOT changed, so the exported .bin / C++ LUT-GEMM stay in parity.
+The DEFAULT codebook is NOT changed (codebook_bits=8), so the exported .bin / C++ LUT-GEMM stay in parity.
+
+OPTIONAL 2-bit-per-weight codebook (codebook_bits=16, row_sigma_learnable only):
+  65,536 entries = the 65,536 smallest E8 lattice points (shells of norm^2 0,2,4,6,8,10 in full plus a
+  sign-symmetric part of shell 12), i.e. a 16-bit index per 8 weights = 2 bits/weight.  Measured on Gaussian
+  weights its relative error is ~0.30 against ~0.56 for the 256-entry (1 bit/weight) codebook.
+  Indices need 16 bits, so exports/C++ for this mode need uint16 indices.  Off by default.
 """
 
 import itertools
@@ -104,6 +110,7 @@ LEARNABLE_CLIP = 2.0
 LEARNABLE_THETA_INIT = 0.0
 LEARNABLE_RANGE_LOW = 0.5      # beta_min = 0.5 * anchor
 LEARNABLE_RANGE_HIGH = 2.0     # beta_max = 2.0 * anchor
+ANCHOR_STD_2BIT = 0.8          # 2-bit codebook: theta=0 gives beta = 1.25*anchor -> scaled-weight std ~1.0 (measured optimum)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -131,6 +138,56 @@ def build_e8_codebook_8bit() -> torch.Tensor:
     return codebook8
 
 
+_CB16_CACHE = {}
+
+
+def build_e8_codebook_16bit() -> torch.Tensor:
+    """65,536-entry E8 codebook (2 bits/weight): all E8 points of norm^2 <= 10 (56,881 points) plus 8,655 of the
+    60,480 norm^2=12 points, chosen as +-pairs from a seeded shuffle so the partial shell has no directional bias.
+    (65,535 distinct entries; the last slot repeats the zero vector.)"""
+    if "cb" in _CB16_CACHE:
+        return _CB16_CACHE["cb"].clone()
+    import numpy as np
+    grids = {}
+    ints = np.arange(-3, 4, dtype=np.int8)
+    mesh = np.stack(np.meshgrid(*([ints] * 8), indexing="ij"), axis=-1).reshape(-1, 8)           # 7^8 x 8
+    n_int = (mesh.astype(np.int16) ** 2).sum(1)
+    keep = (mesh.sum(1) % 2 == 0) & (n_int <= 12)
+    int_pts, int_n = mesh[keep].astype(np.float32), n_int[keep]
+    halves = np.array([-2.5, -1.5, -0.5, 0.5, 1.5, 2.5], dtype=np.float32)
+    mesh = np.stack(np.meshgrid(*([halves] * 8), indexing="ij"), axis=-1).reshape(-1, 8)         # 6^8 x 8
+    n_half = (mesh ** 2).sum(1)
+    keep = (np.rint(mesh.sum(1)).astype(np.int64) % 2 == 0) & (n_half <= 12.001)
+    half_pts, half_n = mesh[keep], np.rint(n_half[keep]).astype(np.int64)
+    pts = np.concatenate([int_pts, half_pts])
+    nrm = np.concatenate([int_n.astype(np.int64), half_n])
+    full = pts[nrm <= 10]
+    full = full[np.lexsort(np.rint(full * 2).astype(np.int64).T[::-1] .tolist() + [np.rint((full ** 2).sum(1)).astype(np.int64)])]
+    shell = pts[nrm == 12]
+    need = 65536 - len(full)
+    # +-pairs: keep one representative per {p,-p} (lexicographically smaller), shuffle with a fixed seed
+    key = np.rint(shell * 2).astype(np.int64)
+    rep = np.array([tuple(k) <= tuple(-k) for k in key])
+    reps = shell[rep]
+    rng = np.random.RandomState(0)
+    reps = reps[rng.permutation(len(reps))][: need // 2]
+    chosen = np.concatenate([reps, -reps])
+    cb = np.concatenate([full, chosen])
+    if len(cb) < 65536:
+        cb = np.concatenate([cb, np.zeros((65536 - len(cb), 8), dtype=np.float32)])
+    cb = torch.tensor(cb[:65536], dtype=torch.float32)
+    _CB16_CACHE["cb"] = cb
+    return cb.clone()
+
+
+def build_codebook(bits: int = 8) -> torch.Tensor:
+    if bits == 8:
+        return build_e8_codebook_8bit()
+    if bits == 16:
+        return build_e8_codebook_16bit()
+    raise ValueError(f"codebook_bits must be 8 (1 bit/weight) or 16 (2 bits/weight), got {bits}")
+
+
 # ─────────────────────────────────────────────────────────────
 # Shared nearest-codeword search: fp32, autocast off, TF32 off, chunked.
 # Returns uint8 indices (256 entries fit in one byte).
@@ -139,7 +196,10 @@ def build_e8_codebook_8bit() -> torch.Tensor:
 def nearest_codeword_idx(subvecs: torch.Tensor, codebook: torch.Tensor,
                           norms: torch.Tensor) -> torch.Tensor:
     flat = subvecs.reshape(-1, SUBVEC_DIM)
-    out = torch.empty(flat.shape[0], dtype=torch.uint8, device=flat.device)
+    K = codebook.shape[0]
+    idx_dtype = torch.uint8 if K <= 256 else torch.int32
+    chunk = min(_SEARCH_CHUNK, max(256, (1 << 27) // K))      # keeps the (chunk x K) distance block <= 512 MB
+    out = torch.empty(flat.shape[0], dtype=idx_dtype, device=flat.device)
     prev_tf32 = None
     if flat.is_cuda:
         prev_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -148,10 +208,10 @@ def nearest_codeword_idx(subvecs: torch.Tensor, codebook: torch.Tensor,
         with torch.autocast(device_type=flat.device.type, enabled=False):
             cb_t = codebook.float().t().contiguous()
             nr = norms.float()
-            for i in range(0, flat.shape[0], _SEARCH_CHUNK):
-                d = flat[i:i + _SEARCH_CHUNK].float() @ cb_t       # (n, 256)
+            for i in range(0, flat.shape[0], chunk):
+                d = flat[i:i + chunk].float() @ cb_t               # (n, K)
                 d.mul_(-2.0).add_(nr)                              # |c|^2 - 2<x,c>
-                out[i:i + _SEARCH_CHUNK] = d.argmin(dim=1).to(torch.uint8)
+                out[i:i + chunk] = d.argmin(dim=1).to(idx_dtype)
     finally:
         if prev_tf32 is not None:
             torch.backends.cuda.matmul.allow_tf32 = prev_tf32
@@ -244,8 +304,11 @@ class E8QATLinear(nn.Module):
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 scaling_mode: str = "block_max", learnable: bool = True):
+                 scaling_mode: str = "block_max", learnable: bool = True, codebook_bits: int = 8):
         super().__init__()
+        if codebook_bits != 8 and scaling_mode != "row_sigma_learnable":
+            raise ValueError("codebook_bits=16 (2 bits/weight) is only supported with scaling_mode='row_sigma_learnable'")
+        self.codebook_bits = codebook_bits
         self.in_features = in_features
         self.out_features = out_features
         self.scaling_mode = scaling_mode
@@ -256,7 +319,7 @@ class E8QATLinear(nn.Module):
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
-        codebook = build_e8_codebook_8bit()
+        codebook = build_codebook(codebook_bits)
         norms = (codebook ** 2).sum(dim=1)
         self.register_buffer("codebook", codebook, persistent=False)
         self.register_buffer("norms", norms, persistent=False)
@@ -279,11 +342,11 @@ class E8QATLinear(nn.Module):
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, scaling_mode: str = "block_max",
-                     learnable: bool = True) -> "E8QATLinear":
+                     learnable: bool = True, codebook_bits: int = 8) -> "E8QATLinear":
         """Convert an existing nn.Linear into an E8QATLinear, copying weights."""
         new_layer = cls(linear.in_features, linear.out_features,
                          bias=linear.bias is not None, scaling_mode=scaling_mode,
-                         learnable=learnable)
+                         learnable=learnable, codebook_bits=codebook_bits)
         with torch.no_grad():
             new_layer.weight.copy_(linear.weight)
             if linear.bias is not None:
@@ -324,7 +387,10 @@ class E8QATLinear(nn.Module):
             self.xmax_ema.mul_(m).add_((1 - m) * xmax)
 
     def _bounds(self):
-        anchor = get_row_sigma_ymax() / (ROW_SIGMA_CB * self.sigma_ema)
+        if self.codebook_bits == 8:
+            anchor = get_row_sigma_ymax() / (ROW_SIGMA_CB * self.sigma_ema)       # unchanged 1-bit behaviour
+        else:
+            anchor = ANCHOR_STD_2BIT / self.sigma_ema
         return anchor * LEARNABLE_RANGE_LOW, anchor * LEARNABLE_RANGE_HIGH
 
     def _learnable_quantize_scaled(self, W_scaled: torch.Tensor) -> torch.Tensor:
@@ -377,7 +443,7 @@ class E8QATLinear(nn.Module):
 
     def extra_repr(self):
         s = (f"in_features={self.in_features}, out_features={self.out_features}, "
-             f"e8_8bit_qat=True, scaling_mode={self.scaling_mode!r}")
+             f"e8_qat=True, codebook_bits={self.codebook_bits}, scaling_mode={self.scaling_mode!r}")
         if self.scaling_mode == "row_sigma_learnable":
             s += f", learnable={self.learnable}"
         return s
