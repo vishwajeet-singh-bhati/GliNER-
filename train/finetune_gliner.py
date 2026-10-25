@@ -661,8 +661,19 @@ def main():
     ap.add_argument("--others-lr", type=float, default=5e-5,
                     help="LR of everything that is not the encoder (span/prompt heads, projections). "
                          "Before this flag the heads trained at the same 5e-6 as the encoder.")
-    ap.add_argument("--qat-scale-lr", type=float, default=1e-3,
-                    help="LR of the E8 per-row learnable scales (theta_beta). At 5e-6 they could not move.")
+    ap.add_argument("--qat-scale-lr", type=float, default=0.0,
+                    help="LR of the E8 per-row learnable scales (theta_beta). 0 = frozen (default; the old 1e-3 default "
+                         "was never shown to help and is NOT recommended).")
+    ap.add_argument("--kd-weight", type=float, default=0.0,
+                    help="QAT only: weight of the hidden-state distillation loss (1 - cosine between the quantized "
+                         "encoder's last hidden state and the frozen FP encoder's).  0 = off.")
+    ap.add_argument("--kd-mse-weight", type=float, default=0.0, help="optional relative-MSE term added to the KD loss")
+    ap.add_argument("--task-loss-weight", type=float, default=1.0,
+                    help="weight of the normal GLiNER span loss. 0 = pure encoder distillation (heads untouched).")
+    ap.add_argument("--teacher-fp32", action="store_true",
+                    help="keep the FP teacher in fp32 (default: bf16 on GPU, saves ~0.5 GB VRAM)")
+    ap.add_argument("--diag-every", type=int, default=0,
+                    help="print [qat-diag] (cosine to FP, codeword flip rate, grad norms) every N optimizer steps; 0 = off")
     ap.add_argument("--init-from", default=None,
                     help="Folder with a pytorch_model.bin (e.g. the best FP checkpoint) loaded BEFORE "
                          "quantisation, so QAT starts from a fine-tuned full-precision model.")
@@ -774,6 +785,17 @@ def main():
         print("CHECK-PROMPTS:", "PASS - every window is prompted with all labels" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
+    distiller = None
+    if args.kd_weight > 0 or args.diag_every > 0:
+        import copy as _copy
+        from qat_distill import EncoderDistiller
+        _enc = model.model.token_rep_layer.bert_layer.model
+        _teacher = _copy.deepcopy(_enc)               # FP encoder (already holds the --init-from weights)
+        _tdt = torch.bfloat16 if (use_bf16 and torch.cuda.is_available() and not args.teacher_fp32) else None
+        distiller = EncoderDistiller(_enc, _teacher, mse_weight=args.kd_mse_weight, teacher_dtype=_tdt)
+        print(f"[qat-diag] FP teacher copied; kd_weight={args.kd_weight}, task_loss_weight={args.task_loss_weight}, "
+              f"encoder dropout modules disabled: {distiller.n_dropout_disabled}", flush=True)
+
     if args.quantize:
         print(f"Quantizing backbone encoder(s), scaling_mode={args.scaling_mode} ...")
         n = quantize_gliner_encoder(model, scaling_mode=args.scaling_mode, learnable=args.learnable_scaling)
@@ -854,10 +876,30 @@ def main():
             del sd
             gc.collect()
 
+    orig_compute_loss = TrainerCls.compute_loss
+
+    def patched_compute_loss(self, model_obj, inputs, *c_args, **c_kwargs):
+        res = orig_compute_loss(self, model_obj, inputs, *c_args, **c_kwargs)
+        if distiller is None:
+            return res
+        kd = distiller.take_loss()
+        if kd is None:
+            return res
+        if distiller.should_report(args.diag_every * args.grad_accum):
+            distiller.report(args.grad_accum)
+        if isinstance(res, tuple):
+            return (args.task_loss_weight * res[0] + args.kd_weight * kd,) + tuple(res[1:])
+        return args.task_loss_weight * res + args.kd_weight * kd
+
     def patched_training_step(self, model_obj, inputs, *t_args, **t_kwargs):
         oom_triggered = False
         try:
-            return orig_training_step(self, model_obj, inputs, *t_args, **t_kwargs)
+            out = orig_training_step(self, model_obj, inputs, *t_args, **t_kwargs)
+            if distiller is not None and args.diag_every > 0 and distiller.nfwd % (args.diag_every * args.grad_accum) == 0:
+                from qat_distill import grad_norms
+                g_e8, g_other = grad_norms(model_obj)
+                print(f"[qat-diag] grad norm (accumulated, pre-clip): E8 latent weights {g_e8:.4g} | everything else {g_other:.4g}", flush=True)
+            return out
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 oom_triggered = True
@@ -898,6 +940,7 @@ def main():
     TrainerCls.__init__ = patched_init
     TrainerCls._load_from_checkpoint = patched_load_from_checkpoint
     TrainerCls.training_step = patched_training_step
+    TrainerCls.compute_loss = patched_compute_loss
     TrainerCls.train = patched_train
 
     out_dir_p = Path(args.output_dir)
