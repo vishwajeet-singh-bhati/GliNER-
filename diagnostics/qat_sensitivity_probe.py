@@ -31,6 +31,7 @@ import torch.nn as nn
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "quantization"))
 from e8_quant import E8QATLinear  # noqa: E402
+from ptq_weight_only import fake_quant  # noqa: E402
 
 
 # ---------------------------------------------------------------- helpers (pure, unit-testable)
@@ -49,6 +50,18 @@ def quantize_selected(hf_model: nn.Module, pred, scaling_mode: str, min_features
             new = new.to(device=mod.weight.device, dtype=mod.weight.dtype)   # from_linear builds on the CPU
             setattr(parent, child, new)
             n += 1
+    return n
+
+
+@torch.no_grad()
+def fake_quant_encoder(hf_model: nn.Module, bits: int, group_size: int = 64, min_features: int = 64) -> int:
+    """Scalar (int-b, per-group) round-to-nearest of all encoder Linear weights, in place. For same-bit-budget comparison."""
+    n = 0
+    for layer in hf_model.encoder.layer:
+        for mod in layer.modules():
+            if isinstance(mod, nn.Linear) and mod.in_features >= min_features:
+                mod.weight.data = fake_quant(mod.weight.data, bits, group_size)
+                n += 1
     return n
 
 
@@ -104,10 +117,20 @@ def make_hybrid_configs(n_layers: int):
     return out
 
 
-def run_probe(hf_model, ids, mask, scaling_mode, log=print, extended=False, codebook_bits=8):
+def run_probe(hf_model, ids, mask, scaling_mode, log=print, extended=False, codebook_bits=8, scalar_bits=()):
     hf_model.eval()
     h_fp = run_hidden(hf_model, ids, mask)
     results = []
+    if scalar_bits:
+        for b in scalar_bits:
+            q = copy.deepcopy(hf_model)
+            n = fake_quant_encoder(q, b, 64)
+            q.eval()
+            per_layer = compare(h_fp, run_hidden(q, ids, mask), mask)
+            results.append((f"scalar int{b} (groups of 64), all", n, per_layer))
+            cos, rel, ratio, fin = per_layer[-1]
+            log(f"{f'scalar int{b} g64, all 72 (reference)':<34}{n:>4} linears | cos {cos:7.3f} | rel.err {rel:7.3f} | norm ratio {ratio:6.2f} | finite {fin}")
+            del q
     configs = make_configs(len(hf_model.encoder.layer)) + [("all (bf16 autocast)", lambda i, n: True)]
     if extended:
         configs += make_hybrid_configs(len(hf_model.encoder.layer))
@@ -142,7 +165,7 @@ def selftest():
     ids = torch.randint(5, 200, (4, 24))
     mask = torch.ones_like(ids)
     mask[:, 20:] = 0
-    res = run_probe(m, ids, mask, "row_sigma_learnable", extended=True)
+    res = run_probe(m, ids, mask, "row_sigma_learnable", extended=True, scalar_bits=(8, 4, 2))
     by = {r[0]: r for r in res}
     assert by["none (sanity)"][2][-1][0] > 0.9999, "sanity row must be identical to FP"
     assert by["all"][2][-1][3], "outputs must be finite"
@@ -159,6 +182,7 @@ def main():
     ap.add_argument("--scaling-mode", default="row_sigma_learnable")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--codebook-bits", type=int, default=8, choices=[8, 16], help="8 = current 1 bit/weight codebook, 16 = 2 bits/weight")
+    ap.add_argument("--scalar-bits", type=int, nargs="*", default=[], help="also print plain scalar int-b quantization rows (e.g. 8 4 3 2) as a same-bit-budget reference")
     ap.add_argument("--extended", action="store_true", help="also test hybrid configs that keep sensitive parts in FP")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -198,7 +222,7 @@ def main():
     ids, mask = enc["input_ids"].to(dev), enc["attention_mask"].to(dev)
     print(f"probe on {len(texts)} windows, {int(mask.sum())} tokens, device={dev}, layers={len(hf.encoder.layer)}")
     print(f"codebook_bits={args.codebook_bits} ({'2' if args.codebook_bits == 16 else '1'} bit/weight)")
-    results = run_probe(hf, ids, mask, args.scaling_mode, extended=args.extended, codebook_bits=args.codebook_bits)
+    results = run_probe(hf, ids, mask, args.scaling_mode, extended=args.extended, codebook_bits=args.codebook_bits, scalar_bits=args.scalar_bits)
     allrow = next(r for r in results if r[0] == "all")
     print("\nper-layer cosine for 'all' (embedding output, then blocks 1..N):")
     print("  " + " ".join(f"{c:.2f}" for c, _, _, _ in allrow[2]))
