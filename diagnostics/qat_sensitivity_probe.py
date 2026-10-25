@@ -91,11 +91,26 @@ def make_configs(n_layers: int):
     ]
 
 
-def run_probe(hf_model, ids, mask, scaling_mode, log=print):
+def make_hybrid_configs(n_layers: int):
+    """Quantize everything EXCEPT the most sensitive parts (kept in full precision)."""
+    out = []
+    for k in (1, 2, 3, 4):
+        out.append((f"all except last {k} block(s)", lambda i, n, k=k: i < n_layers - k))
+    out.append(("all except FFN of last 4 blocks",
+                lambda i, n: not (i >= n_layers - 4 and not n.startswith("attention"))))
+    out.append(("attention in all blocks + FFN in first 6",
+                lambda i, n: n.startswith("attention") or i < 6))
+    out.append(("first 4 blocks only", lambda i, n: i < 4))
+    return out
+
+
+def run_probe(hf_model, ids, mask, scaling_mode, log=print, extended=False):
     hf_model.eval()
     h_fp = run_hidden(hf_model, ids, mask)
     results = []
     configs = make_configs(len(hf_model.encoder.layer)) + [("all (bf16 autocast)", lambda i, n: True)]
+    if extended:
+        configs += make_hybrid_configs(len(hf_model.encoder.layer))
     for name, pred in configs:
         q = copy.deepcopy(hf_model)
         n = quantize_selected(q, pred, scaling_mode)
@@ -127,7 +142,7 @@ def selftest():
     ids = torch.randint(5, 200, (4, 24))
     mask = torch.ones_like(ids)
     mask[:, 20:] = 0
-    res = run_probe(m, ids, mask, "row_sigma_learnable")
+    res = run_probe(m, ids, mask, "row_sigma_learnable", extended=True)
     by = {r[0]: r for r in res}
     assert by["none (sanity)"][2][-1][0] > 0.9999, "sanity row must be identical to FP"
     assert by["all"][2][-1][3], "outputs must be finite"
@@ -143,6 +158,7 @@ def main():
     ap.add_argument("--max-length", type=int, default=256)
     ap.add_argument("--scaling-mode", default="row_sigma_learnable")
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--extended", action="store_true", help="also test hybrid configs that keep sensitive parts in FP")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -180,7 +196,7 @@ def main():
     hf = hf.float().to(dev)
     ids, mask = enc["input_ids"].to(dev), enc["attention_mask"].to(dev)
     print(f"probe on {len(texts)} windows, {int(mask.sum())} tokens, device={dev}, layers={len(hf.encoder.layer)}")
-    results = run_probe(hf, ids, mask, args.scaling_mode)
+    results = run_probe(hf, ids, mask, args.scaling_mode, extended=args.extended)
     allrow = next(r for r in results if r[0] == "all")
     print("\nper-layer cosine for 'all' (embedding output, then blocks 1..N):")
     print("  " + " ".join(f"{c:.2f}" for c, _, _, _ in allrow[2]))
