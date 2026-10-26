@@ -61,7 +61,7 @@ def n_scales(shape, group_size: int) -> int:
     return rows * -(-cols // g)
 
 
-def quantize_state_dict(sd, bits, group_size=0):
+def quantize_state_dict(sd, bits, group_size=0, e8_bits=0):
     """bits: {'enc':int,'emb':int,'other':int}.  Returns (new_sd, report dict)."""
     new_sd, rep = {}, {k: {"params": 0, "bytes": 0.0, "rel_err_sum": 0.0, "tensors": 0} for k in ("enc", "emb", "other", "float")}
     fp32_bytes = 0.0
@@ -69,7 +69,15 @@ def quantize_state_dict(sd, bits, group_size=0):
         fp32_bytes += t.numel() * 4
         grp = classify(k, t)
         b = bits.get(grp, 0) if grp != "skip" else 0
-        if grp != "skip" and b > 0:
+        if grp == "enc" and b == 0 and e8_bits > 0:
+            # encoder already trained with E8 QAT: the latent float weights stay as they are (the quantized loader
+            # snaps them to the lattice); only the SIZE is accounted as E8 (bits/weight) + per-row scale and sigma (fp16).
+            r = rep["enc"]
+            r["params"] += t.numel()
+            r["bytes"] += t.numel() * e8_bits / 8 + t.shape[0] * 4
+            r["tensors"] += 1
+            new_sd[k] = t
+        elif grp != "skip" and b > 0:
             new_t = fake_quant(t, b, group_size)
             err = ((new_t.float() - t.float()).norm() / t.float().norm().clamp_min(1e-12)).item()
             r = rep[grp]
@@ -120,6 +128,12 @@ def selftest():
     q = new["m.token_rep_layer.bert_layer.model.encoder.layer.0.attention.self.query_proj.weight"]
     assert q.shape == (64, 64) and len(torch.unique(q[0])) <= 255
     print_report(rep, {"enc": 8, "emb": 8, "other": 0}, 0)
+    # E8 accounting: encoder untouched, counted at 1 bit/weight + 4 bytes per row
+    sd_e8 = {k: v.clone() for k, v in sd.items()}
+    new_e8, rep_e8 = quantize_state_dict(sd_e8, {"enc": 0, "emb": 8, "other": 8}, 0, e8_bits=1)
+    enc_key = "m.token_rep_layer.bert_layer.model.encoder.layer.0.attention.self.query_proj.weight"
+    assert torch.equal(new_e8[enc_key], sd_e8[enc_key]), "E8 mode must not touch the encoder weights"
+    assert rep_e8["enc"]["params"] == 64 * 64 and abs(rep_e8["enc"]["bytes"] - (64 * 64 / 8 + 64 * 4)) < 1e-6
     print("SELFTEST OK")
 
 
@@ -131,6 +145,9 @@ def main():
     ap.add_argument("--emb-bits", type=int, default=8)
     ap.add_argument("--other-bits", type=int, default=0)
     ap.add_argument("--group-size", type=int, default=0, help="0 = per output row; e.g. 64 or 128 for group-wise")
+    ap.add_argument("--e8-bits", type=int, default=0, choices=[0, 1, 2],
+                    help="use with --enc-bits 0 on an E8-QAT checkpoint: leaves the encoder weights untouched and counts "
+                         "them as 1 or 2 bits/weight (+ per-row scales) in the size report")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -148,7 +165,7 @@ def main():
     else:
         sd = torch.load(str(wf), map_location="cpu", weights_only=True)
     bits = {"enc": args.enc_bits, "emb": args.emb_bits, "other": args.other_bits}
-    new_sd, rep = quantize_state_dict(sd, bits, args.group_size)
+    new_sd, rep = quantize_state_dict(sd, bits, args.group_size, args.e8_bits)
     total = print_report(rep, bits, args.group_size)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
