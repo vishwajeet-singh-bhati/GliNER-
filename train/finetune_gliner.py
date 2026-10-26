@@ -670,6 +670,8 @@ def main():
     ap.add_argument("--kd-mse-weight", type=float, default=0.0, help="optional relative-MSE term added to the KD loss")
     ap.add_argument("--task-loss-weight", type=float, default=1.0,
                     help="weight of the normal GLiNER span loss. 0 = pure encoder distillation (heads untouched).")
+    ap.add_argument("--kd-centered-weight", type=float, default=0.0,
+                    help="extra KD term: 1 - cosine of the window-mean-removed hidden states (token detail, not the shared direction)")
     ap.add_argument("--special-min-id", type=int, default=250102,
                     help="token ids >= this are GLiNER's added prompt tokens; the diag prints cosine on them separately")
     ap.add_argument("--kd-special-weight", type=float, default=1.0,
@@ -770,9 +772,14 @@ def main():
 
     if args.init_from:
         init_bin = Path(args.init_from) / "pytorch_model.bin"
-        if not init_bin.exists():
-            raise FileNotFoundError(f"--init-from: {init_bin} not found")
-        sd0 = torch.load(str(init_bin), map_location="cpu")
+        init_st = Path(args.init_from) / "model.safetensors"
+        if init_bin.exists():
+            sd0 = torch.load(str(init_bin), map_location="cpu")
+        elif init_st.exists():
+            from safetensors.torch import load_file
+            sd0 = load_file(str(init_st), device="cpu")
+        else:
+            raise FileNotFoundError(f"--init-from: neither {init_bin} nor {init_st} found")
         matched0, total0, miss0, unexp0 = smart_load_state_dict(model, sd0)
         print(f"Initialised from {args.init_from}: {matched0}/{total0} tensors (missing={len(miss0)}, unexpected={len(unexp0)})")
         if matched0 < 0.9 * total0:
@@ -797,7 +804,8 @@ def main():
         _teacher = _copy.deepcopy(_enc)               # FP encoder (already holds the --init-from weights)
         _tdt = torch.bfloat16 if (use_bf16 and torch.cuda.is_available() and not args.teacher_fp32) else None
         distiller = EncoderDistiller(_enc, _teacher, mse_weight=args.kd_mse_weight, teacher_dtype=_tdt,
-                                       special_min_id=args.special_min_id, special_weight=args.kd_special_weight)
+                                       special_min_id=args.special_min_id, special_weight=args.kd_special_weight,
+                                       centered_weight=args.kd_centered_weight)
         print(f"[qat-diag] FP teacher copied; kd_weight={args.kd_weight}, task_loss_weight={args.task_loss_weight}, "
               f"encoder dropout modules disabled: {distiller.n_dropout_disabled}", flush=True)
 

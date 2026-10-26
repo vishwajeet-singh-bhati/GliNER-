@@ -54,10 +54,12 @@ def _find_mask(args, kwargs, like):
 class EncoderDistiller:
     def __init__(self, student_enc: nn.Module, teacher_enc: nn.Module, mse_weight: float = 0.0,
                  teacher_dtype=None, disable_dropout: bool = True,
-                 special_min_id=None, special_weight: float = 1.0):
+                 special_min_id=None, special_weight: float = 1.0, centered_weight: float = 0.0):
         self.student = student_enc
         self.special_min_id = special_min_id      # token ids >= this are GLiNER's added prompt tokens (<<ENT>>, <<SEP>>)
         self.special_weight = float(special_weight)
+        self.centered_weight = float(centered_weight)
+        self._cosc = []                          # cosine after removing each window's mean token vector
         self._cos_sp = []
         self._nr, self._nr_sp = [], []          # ||student|| / ||teacher|| per token (cos ignores magnitude!)
         if disable_dropout:
@@ -113,6 +115,15 @@ class EncoderDistiller:
             loss = ((1.0 - cos) * w).sum() / w.sum()
         else:
             loss = (1.0 - cos).mean()
+        # cosine of the window-mean-removed vectors: separates 'matches the shared direction' from 'matches the token detail'
+        mf = mask.unsqueeze(-1).to(s.dtype)
+        n_tok = mf.sum(1, keepdim=True).clamp_min(1.0)
+        s_c = (s - (s * mf).sum(1, keepdim=True) / n_tok)[mask]
+        t_c = (t - (t * mf).sum(1, keepdim=True) / n_tok)[mask]
+        cos_c = F.cosine_similarity(s_c, t_c, dim=-1)
+        if self.centered_weight > 0:
+            loss = loss + self.centered_weight * (1.0 - cos_c).mean()
+        self._cosc.append(cos_c.detach().mean())
         nr = (sm.detach().norm(dim=-1) / tm.norm(dim=-1).clamp_min(1e-12))
         self._nr.append(nr.mean())
         if sp_sel is not None:
@@ -162,7 +173,9 @@ class EncoderDistiller:
         self._cos, self._kd = [], []
         flip = self.flip_share()
         fl = "n/a (first report)" if flip is None else f"{flip * 100:.3f}%"
-        sp = f" | norm ratio {torch.stack(self._nr).mean().item():.3f}" if self._nr else ""
+        sp = f" | cos CENTERED {torch.stack(self._cosc).mean().item():.4f}" if self._cosc else ""
+        self._cosc = []
+        sp += f" | norm ratio {torch.stack(self._nr).mean().item():.3f}" if self._nr else ""
         self._nr = []
         if self._cos_sp:
             sp += (f" | PROMPT tokens: cos {torch.stack(self._cos_sp).mean().item():.4f}, "
@@ -229,7 +242,7 @@ def selftest():
                 n += 1
     student.train()
     ids[:, :3] = 196                                  # pretend these are <<ENT>>/<<SEP>> prompt tokens
-    d = EncoderDistiller(student, teacher, mse_weight=0.1, special_min_id=195, special_weight=3.0)
+    d = EncoderDistiller(student, teacher, mse_weight=0.1, special_min_id=195, special_weight=3.0, centered_weight=0.5)
     opt = torch.optim.Adam([p for p in student.parameters() if p.requires_grad], lr=3e-3)
     first = last = None
     flips_seen = False
