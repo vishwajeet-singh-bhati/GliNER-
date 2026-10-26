@@ -53,8 +53,12 @@ def _find_mask(args, kwargs, like):
 
 class EncoderDistiller:
     def __init__(self, student_enc: nn.Module, teacher_enc: nn.Module, mse_weight: float = 0.0,
-                 teacher_dtype=None, disable_dropout: bool = True):
+                 teacher_dtype=None, disable_dropout: bool = True,
+                 special_min_id=None, special_weight: float = 1.0):
         self.student = student_enc
+        self.special_min_id = special_min_id      # token ids >= this are GLiNER's added prompt tokens (<<ENT>>, <<SEP>>)
+        self.special_weight = float(special_weight)
+        self._cos_sp = []
         if disable_dropout:
             # The teacher runs without dropout; a student WITH dropout can never reach cos=1 and the diagnostic
             # baseline would read ~0.1 low.  (HF's Trainer calls model.train() every step, so set p=0, not .eval().)
@@ -96,7 +100,20 @@ class EncoderDistiller:
         mask = _find_mask(args, kwargs, s)
         sm, tm = s[mask], t[mask]
         cos = F.cosine_similarity(sm, tm, dim=-1)
-        loss = (1.0 - cos).mean()
+        sp_sel = None
+        ids = args[0] if (args and torch.is_tensor(args[0])) else kwargs.get("input_ids")
+        if self.special_min_id is not None and ids is not None and tuple(ids.shape) == tuple(mask.shape):
+            sp_sel = ((ids >= self.special_min_id) & mask)[mask]
+            if not bool(sp_sel.any()):
+                sp_sel = None
+        if sp_sel is not None and self.special_weight != 1.0:
+            w = torch.ones_like(cos)
+            w[sp_sel] = self.special_weight
+            loss = ((1.0 - cos) * w).sum() / w.sum()
+        else:
+            loss = (1.0 - cos).mean()
+        if sp_sel is not None:
+            self._cos_sp.append(cos.detach()[sp_sel].mean())
         if self.mse_weight > 0:
             loss = loss + self.mse_weight * ((sm - tm).pow(2).sum() / tm.pow(2).sum().clamp_min(1e-12))
         self.kd = loss
@@ -141,7 +158,11 @@ class EncoderDistiller:
         self._cos, self._kd = [], []
         flip = self.flip_share()
         fl = "n/a (first report)" if flip is None else f"{flip * 100:.3f}%"
-        log(f"[qat-diag] step ~{self.nfwd // max(1, grad_accum):>5} | cos(student,FP) {cos:.4f} | kd {kd:.4f} "
+        sp = ""
+        if self._cos_sp:
+            sp = f" | cos on prompt tokens {torch.stack(self._cos_sp).mean().item():.4f}"
+            self._cos_sp = []
+        log(f"[qat-diag] step ~{self.nfwd // max(1, grad_accum):>5} | cos(student,FP) {cos:.4f}{sp} | kd {kd:.4f} "
             f"| weights flipped since last report {fl} | avg over {n} fwd", flush=True)
 
 
@@ -201,7 +222,8 @@ def selftest():
                 setattr(parent, child, E8QATLinear.from_linear(mod, scaling_mode="row_sigma_learnable", learnable=False))
                 n += 1
     student.train()
-    d = EncoderDistiller(student, teacher, mse_weight=0.1)
+    ids[:, :3] = 196                                  # pretend these are <<ENT>>/<<SEP>> prompt tokens
+    d = EncoderDistiller(student, teacher, mse_weight=0.1, special_min_id=195, special_weight=3.0)
     opt = torch.optim.Adam([p for p in student.parameters() if p.requires_grad], lr=3e-3)
     first = last = None
     flips_seen = False
@@ -222,6 +244,7 @@ def selftest():
             first = c
         last = c
     assert last > first + 0.02, f"distillation did not raise cosine: {first:.3f} -> {last:.3f}"
+    assert d.nfwd > 0
     print(f"layers quantized: {n} | cos {first:.3f} -> {last:.3f}")
     print("SELFTEST OK")
 

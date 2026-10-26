@@ -670,6 +670,10 @@ def main():
     ap.add_argument("--kd-mse-weight", type=float, default=0.0, help="optional relative-MSE term added to the KD loss")
     ap.add_argument("--task-loss-weight", type=float, default=1.0,
                     help="weight of the normal GLiNER span loss. 0 = pure encoder distillation (heads untouched).")
+    ap.add_argument("--special-min-id", type=int, default=250102,
+                    help="token ids >= this are GLiNER's added prompt tokens; the diag prints cosine on them separately")
+    ap.add_argument("--kd-special-weight", type=float, default=1.0,
+                    help="extra weight of the prompt tokens in the KD loss (1 = same as every token)")
     ap.add_argument("--teacher-fp32", action="store_true",
                     help="keep the FP teacher in fp32 (default: bf16 on GPU, saves ~0.5 GB VRAM)")
     ap.add_argument("--diag-every", type=int, default=0,
@@ -792,7 +796,8 @@ def main():
         _enc = model.model.token_rep_layer.bert_layer.model
         _teacher = _copy.deepcopy(_enc)               # FP encoder (already holds the --init-from weights)
         _tdt = torch.bfloat16 if (use_bf16 and torch.cuda.is_available() and not args.teacher_fp32) else None
-        distiller = EncoderDistiller(_enc, _teacher, mse_weight=args.kd_mse_weight, teacher_dtype=_tdt)
+        distiller = EncoderDistiller(_enc, _teacher, mse_weight=args.kd_mse_weight, teacher_dtype=_tdt,
+                                       special_min_id=args.special_min_id, special_weight=args.kd_special_weight)
         print(f"[qat-diag] FP teacher copied; kd_weight={args.kd_weight}, task_loss_weight={args.task_loss_weight}, "
               f"encoder dropout modules disabled: {distiller.n_dropout_disabled}", flush=True)
 
