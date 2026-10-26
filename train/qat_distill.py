@@ -59,6 +59,7 @@ class EncoderDistiller:
         self.special_min_id = special_min_id      # token ids >= this are GLiNER's added prompt tokens (<<ENT>>, <<SEP>>)
         self.special_weight = float(special_weight)
         self._cos_sp = []
+        self._nr, self._nr_sp = [], []          # ||student|| / ||teacher|| per token (cos ignores magnitude!)
         if disable_dropout:
             # The teacher runs without dropout; a student WITH dropout can never reach cos=1 and the diagnostic
             # baseline would read ~0.1 low.  (HF's Trainer calls model.train() every step, so set p=0, not .eval().)
@@ -112,8 +113,11 @@ class EncoderDistiller:
             loss = ((1.0 - cos) * w).sum() / w.sum()
         else:
             loss = (1.0 - cos).mean()
+        nr = (sm.detach().norm(dim=-1) / tm.norm(dim=-1).clamp_min(1e-12))
+        self._nr.append(nr.mean())
         if sp_sel is not None:
             self._cos_sp.append(cos.detach()[sp_sel].mean())
+            self._nr_sp.append(nr[sp_sel].mean())
         if self.mse_weight > 0:
             loss = loss + self.mse_weight * ((sm - tm).pow(2).sum() / tm.pow(2).sum().clamp_min(1e-12))
         self.kd = loss
@@ -158,10 +162,12 @@ class EncoderDistiller:
         self._cos, self._kd = [], []
         flip = self.flip_share()
         fl = "n/a (first report)" if flip is None else f"{flip * 100:.3f}%"
-        sp = ""
+        sp = f" | norm ratio {torch.stack(self._nr).mean().item():.3f}" if self._nr else ""
+        self._nr = []
         if self._cos_sp:
-            sp = f" | cos on prompt tokens {torch.stack(self._cos_sp).mean().item():.4f}"
-            self._cos_sp = []
+            sp += (f" | PROMPT tokens: cos {torch.stack(self._cos_sp).mean().item():.4f}, "
+                   f"norm ratio {torch.stack(self._nr_sp).mean().item():.3f}")
+            self._cos_sp, self._nr_sp = [], []
         log(f"[qat-diag] step ~{self.nfwd // max(1, grad_accum):>5} | cos(student,FP) {cos:.4f}{sp} | kd {kd:.4f} "
             f"| weights flipped since last report {fl} | avg over {n} fwd", flush=True)
 
