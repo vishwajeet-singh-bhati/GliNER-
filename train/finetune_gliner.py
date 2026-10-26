@@ -676,6 +676,9 @@ def main():
                     help="token ids >= this are GLiNER's added prompt tokens; the diag prints cosine on them separately")
     ap.add_argument("--kd-special-weight", type=float, default=1.0,
                     help="extra weight of the prompt tokens in the KD loss (1 = same as every token)")
+    ap.add_argument("--teacher-from", default=None,
+                    help="checkpoint dir of the FP model to use as the distillation teacher (needed when --init-from points "
+                         "at an already-quantized/trained checkpoint, e.g. a distilled one)")
     ap.add_argument("--teacher-fp32", action="store_true",
                     help="keep the FP teacher in fp32 (default: bf16 on GPU, saves ~0.5 GB VRAM)")
     ap.add_argument("--diag-every", type=int, default=0,
@@ -802,6 +805,22 @@ def main():
         from qat_distill import EncoderDistiller
         _enc = model.model.token_rep_layer.bert_layer.model
         _teacher = _copy.deepcopy(_enc)               # FP encoder (already holds the --init-from weights)
+        if args.teacher_from:
+            from qat_distill import load_encoder_state
+            _tp = Path(args.teacher_from)
+            _tf = next((_tp / n for n in ("pytorch_model.bin", "model.safetensors") if (_tp / n).exists()), None)
+            if _tf is None:
+                raise FileNotFoundError(f"--teacher-from: no pytorch_model.bin / model.safetensors in {_tp}")
+            if _tf.suffix == ".safetensors":
+                from safetensors.torch import load_file as _lf
+                _tsd = _lf(str(_tf), device="cpu")
+            else:
+                _tsd = torch.load(str(_tf), map_location="cpu")
+            _n_ok, _n_miss = load_encoder_state(_teacher, _tsd)
+            print(f"[qat-diag] teacher encoder loaded from {_tp}: {_n_ok} tensors, missing={_n_miss}", flush=True)
+            if _n_miss or not _n_ok:
+                raise RuntimeError("--teacher-from did not match the encoder; wrong checkpoint?")
+            del _tsd
         _tdt = torch.bfloat16 if (use_bf16 and torch.cuda.is_available() and not args.teacher_fp32) else None
         distiller = EncoderDistiller(_enc, _teacher, mse_weight=args.kd_mse_weight, teacher_dtype=_tdt,
                                        special_min_id=args.special_min_id, special_weight=args.kd_special_weight,

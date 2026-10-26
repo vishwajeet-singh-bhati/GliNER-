@@ -185,6 +185,18 @@ class EncoderDistiller:
             f"| weights flipped since last report {fl} | avg over {n} fwd", flush=True)
 
 
+def load_encoder_state(encoder: nn.Module, full_sd: dict):
+    """Load the FP encoder weights out of a FULL GLiNER state dict (keys like '...bert_layer.model.<encoder key>').
+    Returns (n_loaded, n_missing).  Used to build the teacher from the FP checkpoint when the student starts elsewhere."""
+    anchor = "embeddings.word_embeddings.weight"
+    prefix = next((k[: -len(anchor)] for k in full_sd if k.endswith(anchor)), None)
+    if prefix is None:
+        return 0, len(encoder.state_dict())
+    enc_sd = {k[len(prefix):]: v for k, v in full_sd.items() if k.startswith(prefix)}
+    res = encoder.load_state_dict(enc_sd, strict=False)
+    return len(enc_sd) - len(res.unexpected_keys), len(res.missing_keys)
+
+
 def grad_norms(model: nn.Module):
     """(E8 latent-weight grad norm, grad norm of every other parameter) -- NaN/0 here means a broken path."""
     e8 = {id(m.weight) for m in model.modules() if isinstance(m, E8QATLinear)}
@@ -223,6 +235,14 @@ def selftest():
     assert d0.nfwd == 1 and d0.kd is not None
     assert d0.kd.item() < 1e-5, f"identical student must give ~0 loss, got {d0.kd.item()}"
     d0.handle.remove()
+
+    # 1b) teacher can be rebuilt from a full-model state dict (prefixed keys)
+    other = DebertaV2Model(cfg)
+    full = {"token_rep_layer.bert_layer.model." + k: v for k, v in teacher.state_dict().items()}
+    full["span_rep_layer.project.weight"] = torch.zeros(3, 3)
+    n_loaded, n_missing = load_encoder_state(other, full)
+    assert n_missing == 0 and n_loaded > 0, (n_loaded, n_missing)
+    assert all(torch.equal(a, b) for a, b in zip(other.state_dict().values(), teacher.state_dict().values()))
 
     # 2) eval mode / no_grad must NOT trigger the hook
     same.eval(); same(ids, mask)
