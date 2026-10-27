@@ -65,7 +65,7 @@ def show(items, n=3):
         print("      e.g.", it if len(str(it)) < 300 else str(it)[:300] + "...")
 
 
-def audit(files, samples):
+def audit(files, samples, write_dedup=None, dedup_source="test"):
     data = {k: load(p) for k, p in files.items()}
     print("=" * 90)
     for k, rows in data.items():
@@ -75,11 +75,14 @@ def audit(files, samples):
     print("=" * 90)
 
     # 1. RECON
-    print("\n[1] RECON sentinel left in text")
+    print("\n[1] RECON sentinel left in text  (leak = the literal 'RECON_' ; plain words like 'reconnect' are not)")
     for k, rows in data.items():
-        hits = [" ".join(r["tokenized_text"]) for r in rows if any("recon" in t.lower() for t in r["tokenized_text"])]
-        print(f"  {status(hits)}  {k}: {len(hits)} windows contain 'RECON'")
+        hits = [" ".join(r["tokenized_text"]) for r in rows if any("RECON_" in t for t in r["tokenized_text"])]
+        print(f"  {status(hits)}  {k}: {len(hits)} windows contain 'RECON_'")
         show([h[:200] for h in hits])
+        loose = Counter(t for r in rows for t in r["tokenized_text"] if "recon" in t.lower() and "RECON_" not in t)
+        if loose:
+            print(f"        INFO  other tokens containing 'recon' (normal words, not leaks): {dict(loose.most_common(8))}")
 
     # 2. FIELDS
     print("\n[2] extra keys / field-name tokens")
@@ -167,6 +170,22 @@ def audit(files, samples):
         share = top[0][1] / c
         print(f"  {'WARN' if share > 0.5 else 'INFO'}  {lab:<24} n={c:<6} " + "  ".join(f"{t!r}:{v / c:.0%}" for t, v in top))
 
+    # 8. DEDUP FILE
+    if write_dedup:
+        src = data[dedup_source]
+        seen, keep = set(), []
+        for r in src:
+            h = digit_norm(r["tokenized_text"])
+            if h not in seen:
+                seen.add(h)
+                keep.append(r)
+        with open(write_dedup, "w", encoding="utf-8") as f:
+            for r in keep:
+                f.write(json.dumps(r) + "\n")
+        n_ent = sum(len(r.get("ner", [])) for r in keep)
+        print(f"\n[8] wrote {write_dedup}: {len(keep)} of {len(src)} {dedup_source} windows (one per digit-normalised shape), "
+              f"{sum(1 for r in keep if r.get('ner'))} with entities, {n_ent} entities")
+
     # 7. SAMPLES
     print(f"\n[7] raw samples ({samples} per file, first windows with entities)")
     for k, rows in data.items():
@@ -200,7 +219,7 @@ def selftest():
         with contextlib.redirect_stdout(buf):
             audit({"train": str(p1), "test": str(p2)}, 2)
         out = buf.getvalue()
-    assert "FAIL  train: 1 windows contain 'RECON'" in out, out
+    assert "FAIL  train: 1 windows contain 'RECON_'" in out, out
     assert "FAIL  train: key sets" in out, out
     assert "pii_types" in out
     assert "FAIL  test windows also in train: exact 1/2" in out, out
@@ -213,6 +232,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train"); ap.add_argument("--val"); ap.add_argument("--test"); ap.add_argument("--test-capped")
     ap.add_argument("--samples", type=int, default=5)
+    ap.add_argument("--write-dedup", help="write a de-duplicated copy of --dedup-source (one window per digit-normalised shape)")
+    ap.add_argument("--dedup-source", default="test", choices=["train", "val", "test", "test-capped"])
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -221,7 +242,7 @@ def main():
     files = {k: v for k, v in (("train", a.train), ("val", a.val), ("test", a.test), ("test-capped", a.test_capped)) if v}
     if not files:
         ap.error("give at least one of --train/--val/--test/--test-capped")
-    audit(files, a.samples)
+    audit(files, a.samples, a.write_dedup, a.dedup_source)
 
 
 if __name__ == "__main__":
