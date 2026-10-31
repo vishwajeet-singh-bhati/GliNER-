@@ -18,7 +18,8 @@ then reports, at a fixed threshold:
         narrower prediction strictly inside one gold span (missing tokens)
       and prints examples (text with [[gold]] and <<pred>> marked).
 
-Usage (PowerShell, repo root; add --quantized only if the checkpoint needs the quantized loader):
+Usage (PowerShell, repo root). E8-QAT checkpoints and their PTQ variants MUST be run with --quantized
+(they hold latent float weights that the quantized loader snaps to the E8 lattice; the ordinary loader gives ~0.29 F1):
     python diagnostics\\error_matrix.py --model D:\\...\\checkpoint --data-path data\\test_capped_finetune.jsonl `
         --labels-file <train_labels.json> --threshold 0.5 --out-dir eval_results\\matrix_tag
     python diagnostics\\error_matrix.py --selftest
@@ -215,7 +216,7 @@ def main():
     ap.add_argument("--base-model", default="urchade/gliner_multi_pii-v1")
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--quantized", action="store_true")
-    ap.add_argument("--scaling-mode", default="block_max", choices=["block_max", "row_sigma", "row_sigma_learnable"])
+    ap.add_argument("--scaling-mode", default="row_sigma_learnable", choices=["block_max", "row_sigma", "row_sigma_learnable"])
     ap.add_argument("--max-types", type=int, default=25)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--limit", type=int, default=None)
