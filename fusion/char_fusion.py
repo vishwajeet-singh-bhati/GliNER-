@@ -111,14 +111,28 @@ class FusedSpanRep(nn.Module):
         return self.span_rep_layer(words_embedding, span_idx, *a, **kw)
 
 
+class CharFusionCollator:
+    """Module-level (picklable -> works with Windows 'spawn' DataLoader workers) wrapper that builds the
+    original GLiNER collator and adds `char_ids` (raw characters of the same words) to every batch."""
+
+    def __init__(self, *args, base_cls=None, max_chars: int = 32, **kwargs):
+        self.inner = base_cls(*args, **kwargs)
+        self.max_chars = max_chars
+
+    def __call__(self, input_x, *a, **kw):
+        batch = self.inner(input_x, *a, **kw)
+        batch["char_ids"] = build_char_ids([list(x["tokenized_text"]) for x in input_x], self.max_chars)
+        return batch
+
+    def __getattr__(self, name):
+        if name in ("inner", "max_chars"):
+            raise AttributeError(name)
+        return getattr(self.inner, name)
+
+
 def _wrap_collator(base_cls, max_chars):
-    class CharFusionCollator(base_cls):
-        def __call__(self, input_x, *a, **kw):
-            batch = super().__call__(input_x, *a, **kw)
-            batch["char_ids"] = build_char_ids([list(x["tokenized_text"]) for x in input_x], max_chars)
-            return batch
-    CharFusionCollator.__name__ = "CharFusionCollator"
-    return CharFusionCollator
+    import functools
+    return functools.partial(CharFusionCollator, base_cls=base_cls, max_chars=max_chars)
 
 
 def attach_char_fusion(gliner_model, gate_bias: float = 4.0, max_chars: int = 32):
@@ -147,6 +161,11 @@ def is_fusion_state_dict(sd) -> bool:
 
 
 # ----------------------------------------------------------------------------- selftest
+class _B:
+    def __init__(self, config=None, data_processor=None, **kw): pass
+    def __call__(self, input_x, *a, **k): return {}
+
+
 def selftest():
     torch.manual_seed(0)
     ids = build_char_ids([["John", "4111-1111", "a" * 80], ["x"]], 32)
@@ -180,6 +199,11 @@ def selftest():
     assert not torch.equal(x, y) and torch.equal(x, z)
     sd = g.model.state_dict()
     assert is_fusion_state_dict(sd)
+    import pickle
+    c = CharFusionCollator(None, base_cls=_B)
+    c2 = pickle.loads(pickle.dumps(c))
+    out = c2([{"tokenized_text": ["a", "12"]}])
+    assert out["char_ids"].shape == (1, 2, 32)
     print(f"selftest OK  params(fusion)={sum(p.numel() for p in g.model.span_rep_layer.fusion.parameters()):,}  gate~{fus.last_gate_mean:.3f}")
 
 
