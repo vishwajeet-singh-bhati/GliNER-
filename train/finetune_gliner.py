@@ -51,6 +51,8 @@ import gliner.training.trainer as gliner_trainer_mod
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "quantization"))
 from quantize_gliner import quantize_gliner_encoder
 from long_filter import drop_long_examples
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "fusion"))
+from char_fusion import attach_char_fusion, is_fusion_state_dict
 
 
 def load_jsonl(path):
@@ -690,6 +692,9 @@ def main():
                     help="file in --data-dir used for validation / best-checkpoint selection")
     ap.add_argument("--check-prompts", action="store_true",
                     help="print the label prompt GLiNER's collator builds for a few windows and exit")
+    ap.add_argument("--char-fusion", action="store_true",
+                    help="add cross-stream gated fusion (char-CNN structural stream + sigmoid gate) before the span layer")
+    ap.add_argument("--fusion-gate-bias", type=float, default=4.0, help="initial gate bias; 4 -> g~0.98 (starts semantic-only)")
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--grad-accum", type=int, default=8)
@@ -783,11 +788,17 @@ def main():
             sd0 = load_file(str(init_st), device="cpu")
         else:
             raise FileNotFoundError(f"--init-from: neither {init_bin} nor {init_st} found")
+        if args.char_fusion and is_fusion_state_dict(sd0):
+            attach_char_fusion(model, args.fusion_gate_bias)      # checkpoint already has fusion keys
         matched0, total0, miss0, unexp0 = smart_load_state_dict(model, sd0)
         print(f"Initialised from {args.init_from}: {matched0}/{total0} tensors (missing={len(miss0)}, unexpected={len(unexp0)})")
         if matched0 < 0.9 * total0:
             raise RuntimeError("--init-from matched <90% of the model tensors; wrong checkpoint?")
         del sd0
+
+    if args.char_fusion:
+        attach_char_fusion(model, args.fusion_gate_bias)          # no-op if already attached
+        print("[fusion] cross-stream gated fusion attached before span_rep_layer", flush=True)
 
     if args.check_prompts:
         probe = [train_data[i] for i in range(0, len(train_data), max(1, len(train_data) // 6))][:6]

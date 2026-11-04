@@ -523,6 +523,19 @@ def _load_state_dict(weights_path: Path) -> Dict[str, Any]:
     return torch.load(str(weights_path), map_location="cpu", weights_only=True)
 
 
+def _is_fusion_sd(sd) -> bool:
+    return any("span_rep_layer.fusion." in k for k in sd)
+
+
+def _maybe_attach_fusion(model, sd) -> None:
+    """Fusion checkpoints carry extra modules; rebuild them before the strict state-dict load."""
+    if _is_fusion_sd(sd):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "fusion"))
+        from char_fusion import attach_char_fusion
+        attach_char_fusion(model)
+        print("[eval] fusion checkpoint detected: cross-stream gated fusion attached", flush=True)
+
+
 def _detect_quantized_keys(sd: Dict[str, Any]) -> bool:
     for k in sd.keys():
         if any(marker in k for marker in ("row_scale", "block_scale", "quant_", "log_scale", "alpha_scale")):
@@ -572,7 +585,16 @@ def load_ordinary_checkpoint(
                     f"but ordinary loader was used. Pass --quantized explicitly."
                 )
 
-        if (p / "gliner_config.json").exists():
+        if w_file is not None and _is_fusion_sd(sd):
+            struct_source = str(p) if (p / "gliner_config.json").exists() else (
+                str(p.parent) if (p.parent / "gliner_config.json").exists() else base_model)
+            model = GLiNER.from_pretrained(struct_source, local_files_only=local_files_only)
+            _maybe_attach_fusion(model, sd)
+            try:
+                model.load_state_dict(sd, strict=True)
+            except RuntimeError:
+                model.model.load_state_dict(sd, strict=True)
+        elif (p / "gliner_config.json").exists():
             model = GLiNER.from_pretrained(str(p), local_files_only=local_files_only)
         else:
             # Trainer intermediate checkpoint without gliner_config.json:
@@ -629,6 +651,7 @@ def load_quantized_checkpoint(
 
     quantize_gliner_encoder(model, scaling_mode=scaling_mode, learnable=learnable_scaling)
     sd = _load_state_dict(w_file)
+    _maybe_attach_fusion(model, sd)
     try:
         model.load_state_dict(sd, strict=True)
     except RuntimeError:
