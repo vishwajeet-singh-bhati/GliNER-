@@ -33,6 +33,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "diagnostics"))
+sys.path.insert(0, str(REPO / "fusion"))
 import error_matrix as em  # noqa: E402
 from data_audit import digit_norm  # noqa: E402
 
@@ -64,6 +65,8 @@ CONFIGS = [
     ("F4", "F fusion", "BASELINE FP checkpoint-6792, val-selected threshold", FP, False, "capped", None, None),
     ("F5", "F fusion", "BASELINE FP checkpoint-6792, val-selected threshold", FP, False, "full", None, None),
     ("F6", "F fusion", "FUSION FP checkpoint-4528 (val-F1 winner)", FUS + r"\checkpoint-4528", False, "capped", None, None),
+    # ablation: same fusion-trained weights, structural stream switched off at inference
+    ("F7", "F fusion", "FUSION-trained checkpoint-6792 [bypass] structural stream off", FUS + r"\checkpoint-6792", False, "capped", None, None),
 ]
 
 
@@ -142,6 +145,12 @@ def evaluate_one(cfg, ev, ctx, args):
     else:
         model = ev.load_ordinary_checkpoint(model_dir, base_model=args.base_model, device=ctx["device"],
                                             max_types=max(25, len(labels)))
+    if "[bypass]" in name:      # ablation: keep the fusion-trained weights, switch the structural stream OFF (g=1)
+        from char_fusion import FusedSpanRep
+        layer = model.model.span_rep_layer
+        assert isinstance(layer, FusedSpanRep), "[bypass] needs a fusion checkpoint"
+        layer.fusion.forward = lambda sem, ch: sem
+        print("[ablation] structural stream bypassed (semantic stream only)", flush=True)
     common = dict(model=model, labels=labels, flat_ner=True, multi_label=False, allow_enclosing_fallback=False,
                   max_len_override=None, progress_every=3000, chunk_unit="words", batch_size=args.batch_size,
                   max_subwords=1024)
