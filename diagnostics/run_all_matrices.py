@@ -38,6 +38,7 @@ from data_audit import digit_norm  # noqa: E402
 
 FP = r"fp-v2_6800steps_2026-10-24\checkpoint-6792"
 S3 = r"clean\s3-joint-10ep"
+FUS = r"fusion-v1.2_fp-data-sha8faf998e_6800steps_2026-11-05"
 GRID = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99]
 
 # id, PDF table, row name, model dir (relative to --models-root), quantized loader?, test set, fixed threshold (None = select on val), PDF micro-F1
@@ -55,6 +56,14 @@ CONFIGS = [
     ("C4", "C dedup", "1-bit E8 QAT + INT6 embeddings", S3 + r"\ptq-emb6", True, "dedup", None, 0.832),
     ("C5", "C dedup", "1-bit E8 QAT + INT4 emb, group size 128", S3 + r"\ptq-emb4-g128", True, "dedup", None, 0.884),
     ("C6", "C dedup", "1-bit E8 QAT + INT4 emb, per-row", S3 + r"\ptq-e8enc-emb4", True, "dedup", None, 0.887),
+    # ---- F: cross-stream gated fusion (code tag fusion-v1.2-char-gated); same data/recipe as the FP baseline.
+    # All thresholds selected on the validation file (same rule for fusion and the FP re-runs F4/F5), expect=None -> "NEW".
+    ("F1", "F fusion", "FUSION FP checkpoint-6792 (primary)", FUS + r"\checkpoint-6792", False, "capped", None, None),
+    ("F2", "F fusion", "FUSION FP checkpoint-6792 (primary)", FUS + r"\checkpoint-6792", False, "full", None, None),
+    ("F3", "F fusion", "FUSION FP checkpoint-6792 (primary)", FUS + r"\checkpoint-6792", False, "dedup", None, None),
+    ("F4", "F fusion", "BASELINE FP checkpoint-6792, val-selected threshold", FP, False, "capped", None, None),
+    ("F5", "F fusion", "BASELINE FP checkpoint-6792, val-selected threshold", FP, False, "full", None, None),
+    ("F6", "F fusion", "FUSION FP checkpoint-4528 (val-F1 winner)", FUS + r"\checkpoint-4528", False, "capped", None, None),
 ]
 
 
@@ -160,7 +169,7 @@ def evaluate_one(cfg, ev, ctx, args):
     with contextlib.redirect_stdout(buf):
         em.report(store, labels, thr, d)
     section = md_section(cfg, thr, len(store), labels, span, win, counts, m, note)
-    flag = "OK" if abs(m["micro_f1"] - expect) <= 0.01 else "MISMATCH"
+    flag = "NEW" if expect is None else ("OK" if abs(m["micro_f1"] - expect) <= 0.01 else "MISMATCH")
     (d / "section.md").write_text(section, encoding="utf-8")
     res = dict(id=cid, table=table, name=name, test=test, thr=thr, check=flag, expect=expect, m=m, section=section,
                span={l: {k: span[l][k] for k in ("tp", "fp", "fn")} for l in labels},
