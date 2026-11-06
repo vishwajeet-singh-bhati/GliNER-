@@ -39,6 +39,7 @@ from data_audit import digit_norm  # noqa: E402
 
 FP = r"fp-v2_6800steps_2026-10-24\checkpoint-6792"
 S3 = r"clean\s3-joint-10ep"
+CTL = r"fpcontrol-c0e3a8e_fp-data-sha8faf998e_6800steps_2026-11-06"
 FUS = r"fusion-v1.2_fp-data-sha8faf998e_6800steps_2026-11-05"
 GRID = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99]
 
@@ -65,6 +66,9 @@ CONFIGS = [
     ("F4", "F fusion", "BASELINE FP checkpoint-6792, val-selected threshold", FP, False, "capped", None, None),
     ("F5", "F fusion", "BASELINE FP checkpoint-6792, val-selected threshold", FP, False, "full", None, None),
     ("F6", "F fusion", "FUSION FP checkpoint-4528 (val-F1 winner)", FUS + r"\checkpoint-4528", False, "capped", None, None),
+    # control: baseline recipe (no fusion) retrained with the same code/data/steps as the fusion run
+    ("F8", "F fusion", "CONTROL FP retrain (no fusion) checkpoint-6792", CTL + r"\checkpoint-6792", False, "capped", None, None),
+    ("F9", "F fusion", "CONTROL FP retrain (no fusion) checkpoint-6792", CTL + r"\checkpoint-6792", False, "full", None, None),
     # ablation: same fusion-trained weights, structural stream switched off at inference
     ("F7", "F fusion", "FUSION-trained checkpoint-6792 [bypass] structural stream off", FUS + r"\checkpoint-6792", False, "capped", None, None),
 ]
